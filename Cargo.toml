@@ -9,6 +9,8 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dotenvy = "0.15.7"
 ratatui = "0.29"
+reqwest = { version = "0.13.4", features = ["form", "json"] }
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
