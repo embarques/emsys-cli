@@ -38,6 +38,9 @@ pub enum AuthError {
 
     #[error("Firebase returned an invalid ID token")]
     InvalidIdToken,
+
+    #[error("Firebase companyId claim is not a valid EMSYS company ObjectID")]
+    InvalidCompanyId,
 }
 
 impl FirebaseAuthClient {
@@ -184,10 +187,22 @@ fn company_id_from_token(id_token: &str) -> Result<Option<String>, AuthError> {
     let claims: IdTokenClaims =
         serde_json::from_slice(&decoded).map_err(|_| AuthError::InvalidIdToken)?;
 
-    Ok(claims
+    let company_id = claims
         .company_id
         .map(|company_id| company_id.trim().to_string())
-        .filter(|company_id| !company_id.is_empty()))
+        .filter(|company_id| !company_id.is_empty());
+
+    if let Some(company_id) = &company_id {
+        if !is_mongodb_object_id(company_id) {
+            return Err(AuthError::InvalidCompanyId);
+        }
+    }
+
+    Ok(company_id)
+}
+
+fn is_mongodb_object_id(value: &str) -> bool {
+    value.len() == 24 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -224,6 +239,16 @@ mod tests {
         let token = token_with_payload(r#"{"sub":"firebase-user"}"#);
 
         assert_eq!(company_id_from_token(&token).expect("valid token"), None);
+    }
+
+    #[test]
+    fn rejects_invalid_company_id_claim() {
+        let token = token_with_payload(r#"{"companyId":"not-an-object-id"}"#);
+
+        assert!(matches!(
+            company_id_from_token(&token),
+            Err(AuthError::InvalidCompanyId)
+        ));
     }
 
     #[test]
