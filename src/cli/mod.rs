@@ -3,7 +3,11 @@ use clap::{Parser, Subcommand};
 use crate::context::AppContext;
 
 #[derive(Debug, Parser)]
-#[command(name = "emsys-cli", version, about = "EMSYS command-line and terminal interface")]
+#[command(
+    name = "emsys-cli",
+    version,
+    about = "EMSYS command-line and terminal interface"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
