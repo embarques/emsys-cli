@@ -45,8 +45,7 @@ impl EmsysApiClient {
     pub async fn verify_auth(&self) -> Result<AuthSession, ApiError> {
         let session = self.session.refresh().await?;
         let response = self
-            .request(Method::GET, "/users/me")
-            .bearer_auth(&session.id_token)
+            .authenticated_request(Method::GET, "/users/me", &session.id_token)
             .send()
             .await?;
 
@@ -67,9 +66,12 @@ impl EmsysApiClient {
         let session = self.session.refresh().await?;
 
         Ok(self
-            .request(method, path)
-            .bearer_auth(&session.id_token)
+            .authenticated_request(method, path, &session.id_token)
             .header(COMPANY_HEADER, company_id))
+    }
+
+    fn authenticated_request(&self, method: Method, path: &str, id_token: &str) -> RequestBuilder {
+        self.request(method, path).bearer_auth(id_token)
     }
 
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
@@ -109,10 +111,24 @@ mod tests {
     }
 
     #[test]
-    fn tenant_request_builder_adds_company_header() {
+    fn authenticated_request_adds_bearer_token() {
+        let request = client(None)
+            .authenticated_request(Method::GET, "/users/me", "test-token")
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer test-token"
+        );
+        assert!(request.headers().get(COMPANY_HEADER).is_none());
+    }
+
+    #[test]
+    fn tenant_request_adds_company_header() {
         let client = client(Some("64d5c0b0d1eab2aaf30b1818"));
         let request = client
-            .request(Method::GET, "/income-statements")
+            .authenticated_request(Method::GET, "/income-statements", "test-token")
             .header(
                 COMPANY_HEADER,
                 client.company_id.as_deref().expect("company should exist"),
@@ -120,6 +136,10 @@ mod tests {
             .build()
             .expect("request should build");
 
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer test-token"
+        );
         assert_eq!(
             request.headers().get(COMPANY_HEADER).unwrap(),
             "64d5c0b0d1eab2aaf30b1818"
