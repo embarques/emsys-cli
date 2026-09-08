@@ -76,6 +76,49 @@ pub struct IncomeStatementSearchResponse {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct IncomeStatementResponse {
+    pub success: bool,
+    pub message: String,
+    pub data: IncomeStatement,
+    #[serde(default)]
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomeStatementSummaryResponse {
+    pub success: bool,
+    pub message: String,
+    pub data: IncomeStatementSummary,
+    #[serde(default)]
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomeStatementSummary {
+    #[serde(default)]
+    pub currency: String,
+    #[serde(default)]
+    pub rate: f64,
+    #[serde(default)]
+    pub totals: Vec<SummaryTotalLine>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryTotalLine {
+    pub header: String,
+    #[serde(default)]
+    pub value: f64,
+    #[serde(default)]
+    pub order: i64,
+    #[serde(default)]
+    pub details: Vec<SummaryTotalLine>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct IncomeStatement {
     pub id: u32,
     pub date: String,
@@ -202,28 +245,55 @@ impl EmsysApiClient {
             .send()
             .await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.json::<ApiErrorResponse>().await.ok();
-            let message = body
-                .map(|body| {
-                    if body.error.is_empty() {
-                        body.message
-                    } else {
-                        body.error
-                    }
-                })
-                .filter(|message| !message.is_empty())
-                .unwrap_or_else(|| "income statement request failed".to_string());
-
-            return Err(IncomeStatementError::Response {
-                status: status.as_u16(),
-                message,
-            });
-        }
-
-        Ok(response.json().await?)
+        parse_response(response).await
     }
+
+    pub async fn income_statement(
+        &self,
+        id: u32,
+    ) -> Result<IncomeStatementResponse, IncomeStatementError> {
+        let path = format!("/income-statements/{id}");
+        let response = self.tenant_request(Method::GET, &path).await?.send().await?;
+
+        parse_response(response).await
+    }
+
+    pub async fn income_statement_summary(
+        &self,
+        id: u32,
+    ) -> Result<IncomeStatementSummaryResponse, IncomeStatementError> {
+        let path = format!("/income-statements/{id}/summary-total");
+        let response = self.tenant_request(Method::GET, &path).await?.send().await?;
+
+        parse_response(response).await
+    }
+}
+
+async fn parse_response<T>(response: reqwest::Response) -> Result<T, IncomeStatementError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.json::<ApiErrorResponse>().await.ok();
+        let message = body
+            .map(|body| {
+                if body.error.is_empty() {
+                    body.message
+                } else {
+                    body.error
+                }
+            })
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| "income statement request failed".to_string());
+
+        return Err(IncomeStatementError::Response {
+            status: status.as_u16(),
+            message,
+        });
+    }
+
+    Ok(response.json().await?)
 }
 
 #[cfg(test)]
@@ -299,5 +369,32 @@ mod tests {
                 .net_income,
             11335.0
         );
+    }
+
+    #[test]
+    fn deserializes_summary_total_response() {
+        let response: IncomeStatementSummaryResponse = serde_json::from_value(serde_json::json!({
+            "success": true,
+            "message": "Request successful",
+            "data": {
+                "currency": "USD",
+                "rate": 1.0,
+                "totals": [{
+                    "header": "Total Ingresos",
+                    "value": 12800.0,
+                    "order": 2,
+                    "details": [{
+                        "header": "Efectivo",
+                        "value": 4200.0,
+                        "order": 1
+                    }]
+                }]
+            }
+        }))
+        .expect("summary should deserialize");
+
+        assert_eq!(response.data.currency, "USD");
+        assert_eq!(response.data.totals[0].header, "Total Ingresos");
+        assert_eq!(response.data.totals[0].details[0].header, "Efectivo");
     }
 }
