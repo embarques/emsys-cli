@@ -13,7 +13,6 @@ const COMPANY_HEADER: &str = "x-company-id";
 pub struct EmsysApiClient {
     http: Client,
     base_url: String,
-    company_id: Option<String>,
     session: SessionManager,
 }
 
@@ -25,7 +24,7 @@ pub enum ApiError {
     #[error(transparent)]
     Session(#[from] SessionError),
 
-    #[error("no active company configured; set EMSYS_COMPANY_ID")]
+    #[error("authenticated Firebase user has no companyId claim")]
     MissingCompany,
 
     #[error("EMSYS API authentication verification failed with status {0}")]
@@ -37,7 +36,6 @@ impl EmsysApiClient {
         Self {
             http: Client::new(),
             base_url: config.api_url.trim_end_matches('/').to_string(),
-            company_id: config.company_id.clone(),
             session: SessionManager::new(&config.firebase),
         }
     }
@@ -62,12 +60,21 @@ impl EmsysApiClient {
         method: Method,
         path: &str,
     ) -> Result<RequestBuilder, ApiError> {
-        let company_id = self.company_id.as_deref().ok_or(ApiError::MissingCompany)?;
         let session = self.session.refresh().await?;
+        let company_id = session.company_id.as_deref().ok_or(ApiError::MissingCompany)?;
 
-        Ok(self
-            .authenticated_request(method, path, &session.id_token)
-            .header(COMPANY_HEADER, company_id))
+        Ok(self.tenant_authenticated_request(method, path, &session.id_token, company_id))
+    }
+
+    fn tenant_authenticated_request(
+        &self,
+        method: Method,
+        path: &str,
+        id_token: &str,
+        company_id: &str,
+    ) -> RequestBuilder {
+        self.authenticated_request(method, path, id_token)
+            .header(COMPANY_HEADER, company_id)
     }
 
     fn authenticated_request(&self, method: Method, path: &str, id_token: &str) -> RequestBuilder {
@@ -86,10 +93,9 @@ mod tests {
     use super::*;
     use crate::infrastructure::config::FirebaseConfig;
 
-    fn client(company_id: Option<&str>) -> EmsysApiClient {
+    fn client() -> EmsysApiClient {
         EmsysApiClient::new(&AppConfig {
             api_url: "https://api.embarqueros.com".into(),
-            company_id: company_id.map(str::to_string),
             firebase: FirebaseConfig {
                 web_api_key: "firebase-key".into(),
                 project_id: "emsys-project".into(),
@@ -99,7 +105,7 @@ mod tests {
 
     #[test]
     fn builds_v1_request_url() {
-        let request = client(None)
+        let request = client()
             .request(Method::GET, "/users/me")
             .build()
             .expect("request should build");
@@ -111,8 +117,8 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_request_adds_bearer_token() {
-        let request = client(None)
+    fn authenticated_request_adds_bearer_token_only() {
+        let request = client()
             .authenticated_request(Method::GET, "/users/me", "test-token")
             .build()
             .expect("request should build");
@@ -125,13 +131,13 @@ mod tests {
     }
 
     #[test]
-    fn tenant_request_adds_company_header() {
-        let client = client(Some("64d5c0b0d1eab2aaf30b1818"));
-        let request = client
-            .authenticated_request(Method::GET, "/income-statements", "test-token")
-            .header(
-                COMPANY_HEADER,
-                client.company_id.as_deref().expect("company should exist"),
+    fn tenant_authenticated_request_adds_auth_and_company_headers() {
+        let request = client()
+            .tenant_authenticated_request(
+                Method::GET,
+                "/income-statements",
+                "test-token",
+                "64d5c0b0d1eab2aaf30b1818",
             )
             .build()
             .expect("request should build");
