@@ -192,10 +192,10 @@ fn company_id_from_token(id_token: &str) -> Result<Option<String>, AuthError> {
         .map(|company_id| company_id.trim().to_string())
         .filter(|company_id| !company_id.is_empty());
 
-    if let Some(company_id) = &company_id {
-        if !is_mongodb_object_id(company_id) {
-            return Err(AuthError::InvalidCompanyId);
-        }
+    if let Some(company_id) = &company_id
+        && !is_mongodb_object_id(company_id)
+    {
+        return Err(AuthError::InvalidCompanyId);
     }
 
     Ok(company_id)
