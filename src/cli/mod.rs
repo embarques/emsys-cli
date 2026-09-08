@@ -8,7 +8,9 @@ use crate::{
     infrastructure::{
         api::EmsysApiClient,
         auth::FirebaseAuthClient,
-        income_statement::{IncomeStatementSearchRequest, Pagination, Sort},
+        income_statement::{
+            IncomeStatementSearchRequest, Pagination, Sort, SummaryTotalLine,
+        },
         session::SessionManager,
     },
 };
@@ -58,6 +60,12 @@ pub enum AuthCommand {
 pub enum IncomeCommand {
     /// Search income statements for the authenticated company.
     Search(IncomeSearchArgs),
+
+    /// Show one income statement with its calculated summary totals.
+    Show {
+        /// Income statement numeric ID.
+        id: u32,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -109,6 +117,7 @@ async fn run_auth(context: &AppContext, command: AuthCommand) -> anyhow::Result<
 async fn run_income(context: &AppContext, command: IncomeCommand) -> anyhow::Result<()> {
     match command {
         IncomeCommand::Search(args) => search_income_statements(context, args).await,
+        IncomeCommand::Show { id } => show_income_statement(context, id).await,
     }
 }
 
@@ -198,6 +207,42 @@ async fn search_income_statements(
     }
 
     Ok(())
+}
+
+async fn show_income_statement(context: &AppContext, id: u32) -> anyhow::Result<()> {
+    let api = EmsysApiClient::new(&context.config);
+    let statement = api.income_statement(id).await?.data;
+    let summary = api.income_statement_summary(id).await?.data;
+
+    let branch = statement
+        .branch
+        .as_ref()
+        .map(|branch| branch.name.as_str())
+        .unwrap_or("-");
+
+    println!("Income Statement #{}", statement.id);
+    println!("Date: {}", statement.date);
+    println!("Status: {}", statement.status);
+    println!("Branch: {branch}");
+    println!("Currency: {}", summary.currency);
+    println!("Rate: {:.4}", summary.rate);
+    println!();
+    println!("Summary Totals");
+
+    for line in &summary.totals {
+        print_summary_total(line, 0);
+    }
+
+    Ok(())
+}
+
+fn print_summary_total(line: &SummaryTotalLine, depth: usize) {
+    let indent = "  ".repeat(depth);
+    println!("{indent}{}: {:.2}", line.header, line.value);
+
+    for detail in &line.details {
+        print_summary_total(detail, depth + 1);
+    }
 }
 
 fn parse_sort(value: &str) -> anyhow::Result<Sort> {
