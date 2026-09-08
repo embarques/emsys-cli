@@ -2,6 +2,7 @@ use reqwest::Client;
 use thiserror::Error;
 
 use crate::infrastructure::{
+    auth::AuthSession,
     config::AppConfig,
     session::{SessionError, SessionManager},
 };
@@ -34,7 +35,7 @@ impl EmsysApiClient {
         }
     }
 
-    pub async fn verify_auth(&self) -> Result<(), ApiError> {
+    pub async fn verify_auth(&self) -> Result<AuthSession, ApiError> {
         let session = self.session.refresh().await?;
         let url = format!("{}/v1/users/me", self.base_url);
         let response = self
@@ -49,6 +50,6 @@ impl EmsysApiClient {
             return Err(ApiError::Verification(status.as_u16()));
         }
 
-        Ok(())
+        Ok(session)
     }
 }
