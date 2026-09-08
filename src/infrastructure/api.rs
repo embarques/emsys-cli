@@ -61,7 +61,10 @@ impl EmsysApiClient {
         path: &str,
     ) -> Result<RequestBuilder, ApiError> {
         let session = self.session.refresh().await?;
-        let company_id = session.company_id.as_deref().ok_or(ApiError::MissingCompany)?;
+        let company_id = session
+            .company_id
+            .as_deref()
+            .ok_or(ApiError::MissingCompany)?;
 
         Ok(self.tenant_authenticated_request(method, path, &session.id_token, company_id))
     }

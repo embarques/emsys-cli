@@ -731,6 +731,7 @@ name = "emsys-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "crossterm 0.29.0",
  "dotenvy",
@@ -739,6 +740,7 @@ dependencies = [
  "reqwest",
  "rpassword",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

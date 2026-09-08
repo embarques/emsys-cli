@@ -7,8 +7,7 @@ use thiserror::Error;
 
 use crate::infrastructure::config::FirebaseConfig;
 
-const SIGN_IN_URL: &str =
-    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword";
+const SIGN_IN_URL: &str = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword";
 const REFRESH_URL: &str = "https://securetoken.googleapis.com/v1/token";
 const FIRESTORE_PROFILE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -257,7 +256,10 @@ fn parse_expiry(value: &str) -> Result<u64, AuthError> {
 }
 
 fn company_id_from_token(id_token: &str) -> Result<Option<String>, AuthError> {
-    let payload = id_token.split('.').nth(1).ok_or(AuthError::InvalidIdToken)?;
+    let payload = id_token
+        .split('.')
+        .nth(1)
+        .ok_or(AuthError::InvalidIdToken)?;
     let decoded = URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| AuthError::InvalidIdToken)?;
@@ -323,7 +325,10 @@ mod tests {
 
     #[test]
     fn rejects_invalid_expiry() {
-        assert!(matches!(parse_expiry("invalid"), Err(AuthError::InvalidExpiry)));
+        assert!(matches!(
+            parse_expiry("invalid"),
+            Err(AuthError::InvalidExpiry)
+        ));
     }
 
     #[test]

@@ -4,11 +4,7 @@ use clap::{Parser, Subcommand};
 
 use crate::{
     context::AppContext,
-    infrastructure::{
-        api::EmsysApiClient,
-        auth::FirebaseAuthClient,
-        session::SessionManager,
-    },
+    infrastructure::{api::EmsysApiClient, auth::FirebaseAuthClient, session::SessionManager},
 };
 
 #[derive(Debug, Parser)]
