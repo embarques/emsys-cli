@@ -89,6 +89,7 @@ async fn login(context: &AppContext) -> anyhow::Result<()> {
     println!("Authentication successful");
     println!("User: {}", session.email.as_deref().unwrap_or(&email));
     println!("Firebase UID: {}", session.user_id);
+    print_company(&session.company_id);
     println!("EMSYS API verification: OK");
     println!("Session saved securely");
 
@@ -101,9 +102,17 @@ async fn auth_status(context: &AppContext) -> anyhow::Result<()> {
 
     println!("Logged in");
     println!("Firebase UID: {}", session.user_id);
+    print_company(&session.company_id);
     println!("EMSYS API verification: OK");
 
     Ok(())
+}
+
+fn print_company(company_id: &Option<String>) {
+    match company_id {
+        Some(company_id) => println!("Company ID: {company_id}"),
+        None => println!("Company ID: not present in Firebase token"),
+    }
 }
 
 fn logout(context: &AppContext) -> anyhow::Result<()> {
