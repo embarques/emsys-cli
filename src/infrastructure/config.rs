@@ -67,10 +67,10 @@ impl AppConfig {
             return Err(ConfigError::Invalid(EMSYS_API_URL));
         }
 
-        if let Some(company_id) = &self.company_id
-            && !is_mongodb_object_id(company_id)
-        {
-            return Err(ConfigError::Invalid(EMSYS_COMPANY_ID));
+        if let Some(company_id) = &self.company_id {
+            if !is_mongodb_object_id(company_id) {
+                return Err(ConfigError::Invalid(EMSYS_COMPANY_ID));
+            }
         }
 
         if self.firebase.web_api_key.trim().is_empty() {
