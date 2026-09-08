@@ -6,9 +6,10 @@ async fn main() -> anyhow::Result<()> {
     bootstrap::init_tracing();
 
     let args = cli::Cli::parse();
+    let context = bootstrap::build_context();
 
     match args.command {
-        Some(command) => cli::run(command).await,
-        None => tui::run().await,
+        Some(command) => cli::run(&context, command).await,
+        None => tui::run(context),
     }
 }

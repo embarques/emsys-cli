@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+use crate::context::AppContext;
+
 #[derive(Debug, Parser)]
 #[command(name = "emsys-cli", version, about = "EMSYS command-line and terminal interface")]
 pub struct Cli {
@@ -13,7 +15,7 @@ pub enum Command {
     Version,
 }
 
-pub async fn run(command: Command) -> anyhow::Result<()> {
+pub async fn run(_context: &AppContext, command: Command) -> anyhow::Result<()> {
     match command {
         Command::Version => {
             println!("emsys-cli {}", env!("CARGO_PKG_VERSION"));
