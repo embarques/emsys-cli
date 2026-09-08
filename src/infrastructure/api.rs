@@ -1,4 +1,4 @@
-use reqwest::Client;
+use reqwest::{Client, Method, RequestBuilder};
 use thiserror::Error;
 
 use crate::infrastructure::{
@@ -7,10 +7,13 @@ use crate::infrastructure::{
     session::{SessionError, SessionManager},
 };
 
+const COMPANY_HEADER: &str = "x-company-id";
+
 #[derive(Debug, Clone)]
 pub struct EmsysApiClient {
     http: Client,
     base_url: String,
+    company_id: Option<String>,
     session: SessionManager,
 }
 
@@ -22,6 +25,9 @@ pub enum ApiError {
     #[error(transparent)]
     Session(#[from] SessionError),
 
+    #[error("no active company configured; set EMSYS_COMPANY_ID")]
+    MissingCompany,
+
     #[error("EMSYS API authentication verification failed with status {0}")]
     Verification(u16),
 }
@@ -31,16 +37,15 @@ impl EmsysApiClient {
         Self {
             http: Client::new(),
             base_url: config.api_url.trim_end_matches('/').to_string(),
+            company_id: config.company_id.clone(),
             session: SessionManager::new(&config.firebase),
         }
     }
 
     pub async fn verify_auth(&self) -> Result<AuthSession, ApiError> {
         let session = self.session.refresh().await?;
-        let url = format!("{}/v1/users/me", self.base_url);
         let response = self
-            .http
-            .get(url)
+            .request(Method::GET, "/users/me")
             .bearer_auth(&session.id_token)
             .send()
             .await?;
@@ -51,5 +56,73 @@ impl EmsysApiClient {
         }
 
         Ok(session)
+    }
+
+    pub async fn tenant_request(
+        &self,
+        method: Method,
+        path: &str,
+    ) -> Result<RequestBuilder, ApiError> {
+        let company_id = self.company_id.as_deref().ok_or(ApiError::MissingCompany)?;
+        let session = self.session.refresh().await?;
+
+        Ok(self
+            .request(method, path)
+            .bearer_auth(&session.id_token)
+            .header(COMPANY_HEADER, company_id))
+    }
+
+    fn request(&self, method: Method, path: &str) -> RequestBuilder {
+        let path = path.trim_start_matches('/');
+        self.http
+            .request(method, format!("{}/v1/{path}", self.base_url))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::config::FirebaseConfig;
+
+    fn client(company_id: Option<&str>) -> EmsysApiClient {
+        EmsysApiClient::new(&AppConfig {
+            api_url: "https://api.embarqueros.com".into(),
+            company_id: company_id.map(str::to_string),
+            firebase: FirebaseConfig {
+                web_api_key: "firebase-key".into(),
+                project_id: "emsys-project".into(),
+            },
+        })
+    }
+
+    #[test]
+    fn builds_v1_request_url() {
+        let request = client(None)
+            .request(Method::GET, "/users/me")
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.embarqueros.com/v1/users/me"
+        );
+    }
+
+    #[test]
+    fn tenant_request_builder_adds_company_header() {
+        let client = client(Some("64d5c0b0d1eab2aaf30b1818"));
+        let request = client
+            .request(Method::GET, "/income-statements")
+            .header(
+                COMPANY_HEADER,
+                client.company_id.as_deref().expect("company should exist"),
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request.headers().get(COMPANY_HEADER).unwrap(),
+            "64d5c0b0d1eab2aaf30b1818"
+        );
     }
 }
