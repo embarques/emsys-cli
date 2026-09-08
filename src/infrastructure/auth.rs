@@ -1,5 +1,7 @@
+use std::time::Duration;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -8,11 +10,13 @@ use crate::infrastructure::config::FirebaseConfig;
 const SIGN_IN_URL: &str =
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword";
 const REFRESH_URL: &str = "https://securetoken.googleapis.com/v1/token";
+const FIRESTORE_PROFILE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct FirebaseAuthClient {
     http: Client,
     api_key: String,
+    project_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +43,7 @@ pub enum AuthError {
     #[error("Firebase returned an invalid ID token")]
     InvalidIdToken,
 
-    #[error("Firebase companyId claim is not a valid EMSYS company ObjectID")]
+    #[error("Firebase companyId is not a valid EMSYS company ObjectID")]
     InvalidCompanyId,
 }
 
@@ -48,6 +52,7 @@ impl FirebaseAuthClient {
         Self {
             http: Client::new(),
             api_key: config.web_api_key.clone(),
+            project_id: config.project_id.clone(),
         }
     }
 
@@ -70,7 +75,9 @@ impl FirebaseAuthClient {
         }
 
         let body: SignInResponse = response.json().await?;
-        let company_id = company_id_from_token(&body.id_token)?;
+        let company_id = self
+            .resolve_company_id(&body.id_token, &body.local_id)
+            .await?;
 
         Ok(AuthSession {
             id_token: body.id_token,
@@ -100,7 +107,9 @@ impl FirebaseAuthClient {
         }
 
         let body: RefreshResponse = response.json().await?;
-        let company_id = company_id_from_token(&body.id_token)?;
+        let company_id = self
+            .resolve_company_id(&body.id_token, &body.user_id)
+            .await?;
 
         Ok(AuthSession {
             id_token: body.id_token,
@@ -110,6 +119,56 @@ impl FirebaseAuthClient {
             email: None,
             company_id,
         })
+    }
+
+    async fn resolve_company_id(
+        &self,
+        id_token: &str,
+        user_id: &str,
+    ) -> Result<Option<String>, AuthError> {
+        if let Some(company_id) = company_id_from_token(id_token)? {
+            return Ok(Some(company_id));
+        }
+
+        self.company_id_from_firestore(id_token, user_id).await
+    }
+
+    async fn company_id_from_firestore(
+        &self,
+        id_token: &str,
+        user_id: &str,
+    ) -> Result<Option<String>, AuthError> {
+        let url = format!(
+            "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents/users/{}",
+            self.project_id, user_id
+        );
+
+        let response = match self
+            .http
+            .get(url)
+            .bearer_auth(id_token)
+            .timeout(FIRESTORE_PROFILE_TIMEOUT)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return Ok(None),
+        };
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let document: FirestoreUserDocument = match response.json().await {
+            Ok(document) => document,
+            Err(_) => return Ok(None),
+        };
+
+        company_id_from_firestore_document(&document)
     }
 }
 
@@ -165,6 +224,24 @@ struct IdTokenClaims {
     company_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FirestoreUserDocument {
+    #[serde(default)]
+    fields: FirestoreUserFields,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FirestoreUserFields {
+    #[serde(rename = "companyId")]
+    company_id: Option<FirestoreStringValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FirestoreStringValue {
+    #[serde(rename = "stringValue")]
+    string_value: String,
+}
+
 async fn firebase_error(response: reqwest::Response, status: u16) -> AuthError {
     let message = response
         .json::<FirebaseErrorEnvelope>()
@@ -187,8 +264,23 @@ fn company_id_from_token(id_token: &str) -> Result<Option<String>, AuthError> {
     let claims: IdTokenClaims =
         serde_json::from_slice(&decoded).map_err(|_| AuthError::InvalidIdToken)?;
 
-    let company_id = claims
-        .company_id
+    validate_company_id(claims.company_id)
+}
+
+fn company_id_from_firestore_document(
+    document: &FirestoreUserDocument,
+) -> Result<Option<String>, AuthError> {
+    validate_company_id(
+        document
+            .fields
+            .company_id
+            .as_ref()
+            .map(|value| value.string_value.clone()),
+    )
+}
+
+fn validate_company_id(company_id: Option<String>) -> Result<Option<String>, AuthError> {
+    let company_id = company_id
         .map(|company_id| company_id.trim().to_string())
         .filter(|company_id| !company_id.is_empty());
 
@@ -212,6 +304,16 @@ mod tests {
     fn token_with_payload(payload: &str) -> String {
         let payload = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         format!("header.{payload}.signature")
+    }
+
+    fn firestore_document(company_id: Option<&str>) -> FirestoreUserDocument {
+        FirestoreUserDocument {
+            fields: FirestoreUserFields {
+                company_id: company_id.map(|company_id| FirestoreStringValue {
+                    string_value: company_id.to_string(),
+                }),
+            },
+        }
     }
 
     #[test]
@@ -242,11 +344,41 @@ mod tests {
     }
 
     #[test]
+    fn extracts_company_id_from_firestore_profile() {
+        let document = firestore_document(Some("64d5c0b0d1eab2aaf30b1818"));
+
+        assert_eq!(
+            company_id_from_firestore_document(&document).expect("valid company"),
+            Some("64d5c0b0d1eab2aaf30b1818".into())
+        );
+    }
+
+    #[test]
+    fn allows_firestore_profile_without_company() {
+        let document = firestore_document(None);
+
+        assert_eq!(
+            company_id_from_firestore_document(&document).expect("missing company is allowed"),
+            None
+        );
+    }
+
+    #[test]
     fn rejects_invalid_company_id_claim() {
         let token = token_with_payload(r#"{"companyId":"not-an-object-id"}"#);
 
         assert!(matches!(
             company_id_from_token(&token),
+            Err(AuthError::InvalidCompanyId)
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_firestore_company_id() {
+        let document = firestore_document(Some("not-an-object-id"));
+
+        assert!(matches!(
+            company_id_from_firestore_document(&document),
             Err(AuthError::InvalidCompanyId)
         ));
     }
