@@ -7,7 +7,7 @@ use crate::{
     infrastructure::{
         api::EmsysApiClient,
         auth::FirebaseAuthClient,
-        credentials::CredentialStore,
+        session::SessionManager,
     },
 };
 
@@ -60,7 +60,7 @@ async fn run_auth(context: &AppContext, command: AuthCommand) -> anyhow::Result<
     match command {
         AuthCommand::Login => login(context).await,
         AuthCommand::Status => auth_status(context).await,
-        AuthCommand::Logout => logout(),
+        AuthCommand::Logout => logout(context),
     }
 }
 
@@ -77,11 +77,14 @@ async fn login(context: &AppContext) -> anyhow::Result<()> {
 
     let auth = FirebaseAuthClient::new(&context.config.firebase);
     let session = auth.sign_in(&email, &password).await?;
+    let sessions = SessionManager::new(&context.config.firebase);
+    sessions.save(&session)?;
 
-    let api = EmsysApiClient::new(&context.config.api_url);
-    api.verify_auth(&session.id_token).await?;
-
-    CredentialStore::new().save_refresh_token(&session.refresh_token)?;
+    let api = EmsysApiClient::new(&context.config);
+    if let Err(error) = api.verify_auth().await {
+        let _ = sessions.clear();
+        return Err(error.into());
+    }
 
     println!("Authentication successful");
     println!("User: {}", session.email.as_deref().unwrap_or(&email));
@@ -93,20 +96,8 @@ async fn login(context: &AppContext) -> anyhow::Result<()> {
 }
 
 async fn auth_status(context: &AppContext) -> anyhow::Result<()> {
-    let credentials = CredentialStore::new();
-    let refresh_token = credentials
-        .load_refresh_token()?
-        .ok_or_else(|| anyhow::anyhow!("not logged in; run `emsys-cli auth login`"))?;
-
-    let auth = FirebaseAuthClient::new(&context.config.firebase);
-    let session = auth.refresh(&refresh_token).await?;
-
-    if session.refresh_token != refresh_token {
-        credentials.save_refresh_token(&session.refresh_token)?;
-    }
-
-    let api = EmsysApiClient::new(&context.config.api_url);
-    api.verify_auth(&session.id_token).await?;
+    let api = EmsysApiClient::new(&context.config);
+    let session = api.verify_auth().await?;
 
     println!("Logged in");
     println!("Firebase UID: {}", session.user_id);
@@ -115,8 +106,10 @@ async fn auth_status(context: &AppContext) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn logout() -> anyhow::Result<()> {
-    if CredentialStore::new().clear_refresh_token()? {
+fn logout(context: &AppContext) -> anyhow::Result<()> {
+    let sessions = SessionManager::new(&context.config.firebase);
+
+    if sessions.clear()? {
         println!("Logged out");
     } else {
         println!("Already logged out");
