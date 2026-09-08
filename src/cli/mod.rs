@@ -1,10 +1,16 @@
 use std::io::{self, Write};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use serde_json::Value;
 
 use crate::{
     context::AppContext,
-    infrastructure::{api::EmsysApiClient, auth::FirebaseAuthClient, session::SessionManager},
+    infrastructure::{
+        api::EmsysApiClient,
+        auth::FirebaseAuthClient,
+        income_statement::{IncomeStatementSearchRequest, Pagination, Sort},
+        session::SessionManager,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -28,6 +34,12 @@ pub enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+
+    /// Income statement commands.
+    Income {
+        #[command(subcommand)]
+        command: IncomeCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -42,6 +54,39 @@ pub enum AuthCommand {
     Logout,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum IncomeCommand {
+    /// Search income statements for the authenticated company.
+    Search(IncomeSearchArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct IncomeSearchArgs {
+    /// Field to filter by, for example status, date, or branch.id.
+    #[arg(long)]
+    field: Option<String>,
+
+    /// Filter operator such as eq, neq, gt, gte, lt, or lte.
+    #[arg(long, default_value = "eq")]
+    operator: String,
+
+    /// Filter value. Used only when --field is provided.
+    #[arg(long, requires = "field")]
+    value: Option<String>,
+
+    /// 1-based result page.
+    #[arg(long, default_value_t = 1)]
+    page: u64,
+
+    /// Number of results to return.
+    #[arg(long, default_value_t = 40)]
+    limit: u64,
+
+    /// Sort expression in field:direction form, for example date:desc.
+    #[arg(long, default_value = "date:desc")]
+    sort: String,
+}
+
 pub async fn run(context: &AppContext, command: Command) -> anyhow::Result<()> {
     match command {
         Command::Version => {
@@ -49,6 +94,7 @@ pub async fn run(context: &AppContext, command: Command) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Auth { command } => run_auth(context, command).await,
+        Command::Income { command } => run_income(context, command).await,
     }
 }
 
@@ -57,6 +103,12 @@ async fn run_auth(context: &AppContext, command: AuthCommand) -> anyhow::Result<
         AuthCommand::Login => login(context).await,
         AuthCommand::Status => auth_status(context).await,
         AuthCommand::Logout => logout(context),
+    }
+}
+
+async fn run_income(context: &AppContext, command: IncomeCommand) -> anyhow::Result<()> {
+    match command {
+        IncomeCommand::Search(args) => search_income_statements(context, args).await,
     }
 }
 
@@ -104,6 +156,75 @@ async fn auth_status(context: &AppContext) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn search_income_statements(
+    context: &AppContext,
+    args: IncomeSearchArgs,
+) -> anyhow::Result<()> {
+    let sort = parse_sort(&args.sort)?;
+    let request = IncomeStatementSearchRequest {
+        field: args.field,
+        operator: args.value.as_ref().map(|_| args.operator),
+        value: args.value.map(Value::String),
+        pagination: Some(Pagination {
+            page: Some(args.page),
+            offset: Some(0),
+            limit: Some(args.limit),
+        }),
+        sort: vec![sort],
+        ..Default::default()
+    };
+
+    let api = EmsysApiClient::new(&context.config);
+    let response = api.search_income_statements(&request).await?;
+
+    println!("Income statements: {}", response.total);
+
+    for statement in response.data {
+        let branch = statement
+            .branch
+            .as_ref()
+            .map(|branch| branch.name.as_str())
+            .unwrap_or("-");
+        let net_income = statement
+            .summary_total
+            .as_ref()
+            .map(|total| total.net_income)
+            .unwrap_or_default();
+
+        println!(
+            "#{} | {} | {} | {} | {} | Net: {:.2}",
+            statement.id,
+            statement.date,
+            statement.status,
+            branch,
+            statement.currency,
+            net_income
+        );
+    }
+
+    Ok(())
+}
+
+fn parse_sort(value: &str) -> anyhow::Result<Sort> {
+    let (field, direction) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("sort must use field:direction, for example date:desc"))?;
+
+    if field.trim().is_empty() {
+        anyhow::bail!("sort field cannot be empty");
+    }
+
+    let direction = direction.trim().to_ascii_lowercase();
+    if direction != "asc" && direction != "desc" {
+        anyhow::bail!("sort direction must be asc or desc");
+    }
+
+    Ok(Sort {
+        field: field.trim().to_string(),
+        direction,
+    })
+}
+
 fn print_company(company_id: &Option<String>) {
     match company_id {
         Some(company_id) => println!("Company ID: {company_id}"),
@@ -130,4 +251,22 @@ fn prompt(label: &str) -> io::Result<String> {
     let mut value = String::new();
     io::stdin().read_line(&mut value)?;
     Ok(value.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_income_statement_sort() {
+        let sort = parse_sort("date:desc").expect("valid sort");
+
+        assert_eq!(sort.field, "date");
+        assert_eq!(sort.direction, "desc");
+    }
+
+    #[test]
+    fn rejects_invalid_income_statement_sort_direction() {
+        assert!(parse_sort("date:newest").is_err());
+    }
 }
