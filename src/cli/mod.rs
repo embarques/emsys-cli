@@ -111,7 +111,7 @@ async fn auth_status(context: &AppContext) -> anyhow::Result<()> {
 fn print_company(company_id: &Option<String>) {
     match company_id {
         Some(company_id) => println!("Company ID: {company_id}"),
-        None => println!("Company ID: not present in Firebase token"),
+        None => println!("Company ID: not available from Firebase profile"),
     }
 }
 
