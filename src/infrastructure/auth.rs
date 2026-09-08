@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -21,6 +22,7 @@ pub struct AuthSession {
     pub expires_in: u64,
     pub user_id: String,
     pub email: Option<String>,
+    pub company_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -33,6 +35,9 @@ pub enum AuthError {
 
     #[error("Firebase returned an invalid expiresIn value")]
     InvalidExpiry,
+
+    #[error("Firebase returned an invalid ID token")]
+    InvalidIdToken,
 }
 
 impl FirebaseAuthClient {
@@ -62,12 +67,15 @@ impl FirebaseAuthClient {
         }
 
         let body: SignInResponse = response.json().await?;
+        let company_id = company_id_from_token(&body.id_token)?;
+
         Ok(AuthSession {
             id_token: body.id_token,
             refresh_token: body.refresh_token,
             expires_in: parse_expiry(&body.expires_in)?,
             user_id: body.local_id,
             email: Some(body.email),
+            company_id,
         })
     }
 
@@ -89,12 +97,15 @@ impl FirebaseAuthClient {
         }
 
         let body: RefreshResponse = response.json().await?;
+        let company_id = company_id_from_token(&body.id_token)?;
+
         Ok(AuthSession {
             id_token: body.id_token,
             refresh_token: body.refresh_token,
             expires_in: parse_expiry(&body.expires_in)?,
             user_id: body.user_id,
             email: None,
+            company_id,
         })
     }
 }
@@ -145,6 +156,12 @@ struct FirebaseErrorBody {
     message: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct IdTokenClaims {
+    #[serde(rename = "companyId")]
+    company_id: Option<String>,
+}
+
 async fn firebase_error(response: reqwest::Response, status: u16) -> AuthError {
     let message = response
         .json::<FirebaseErrorEnvelope>()
@@ -159,9 +176,28 @@ fn parse_expiry(value: &str) -> Result<u64, AuthError> {
     value.parse().map_err(|_| AuthError::InvalidExpiry)
 }
 
+fn company_id_from_token(id_token: &str) -> Result<Option<String>, AuthError> {
+    let payload = id_token.split('.').nth(1).ok_or(AuthError::InvalidIdToken)?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| AuthError::InvalidIdToken)?;
+    let claims: IdTokenClaims =
+        serde_json::from_slice(&decoded).map_err(|_| AuthError::InvalidIdToken)?;
+
+    Ok(claims
+        .company_id
+        .map(|company_id| company_id.trim().to_string())
+        .filter(|company_id| !company_id.is_empty()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn token_with_payload(payload: &str) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        format!("header.{payload}.signature")
+    }
 
     #[test]
     fn parses_expiry_seconds() {
@@ -171,5 +207,30 @@ mod tests {
     #[test]
     fn rejects_invalid_expiry() {
         assert!(matches!(parse_expiry("invalid"), Err(AuthError::InvalidExpiry)));
+    }
+
+    #[test]
+    fn extracts_company_id_from_token_claim() {
+        let token = token_with_payload(r#"{"companyId":"64d5c0b0d1eab2aaf30b1818"}"#);
+
+        assert_eq!(
+            company_id_from_token(&token).expect("valid token"),
+            Some("64d5c0b0d1eab2aaf30b1818".into())
+        );
+    }
+
+    #[test]
+    fn allows_token_without_company_claim() {
+        let token = token_with_payload(r#"{"sub":"firebase-user"}"#);
+
+        assert_eq!(company_id_from_token(&token).expect("valid token"), None);
+    }
+
+    #[test]
+    fn rejects_invalid_token_payload() {
+        assert!(matches!(
+            company_id_from_token("not-a-jwt"),
+            Err(AuthError::InvalidIdToken)
+        ));
     }
 }
