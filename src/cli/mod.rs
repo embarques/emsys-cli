@@ -193,12 +193,7 @@ async fn search_income_statements(
 
         println!(
             "#{} | {} | {} | {} | {} | Net: {:.2}",
-            statement.id,
-            statement.date,
-            statement.status,
-            branch,
-            statement.currency,
-            net_income
+            statement.id, statement.date, statement.status, branch, statement.currency, net_income
         );
     }
 
