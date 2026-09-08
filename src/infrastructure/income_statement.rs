@@ -253,7 +253,11 @@ impl EmsysApiClient {
         id: u32,
     ) -> Result<IncomeStatementResponse, IncomeStatementError> {
         let path = format!("/income-statements/{id}");
-        let response = self.tenant_request(Method::GET, &path).await?.send().await?;
+        let response = self
+            .tenant_request(Method::GET, &path)
+            .await?
+            .send()
+            .await?;
 
         parse_response(response).await
     }
@@ -263,7 +267,11 @@ impl EmsysApiClient {
         id: u32,
     ) -> Result<IncomeStatementSummaryResponse, IncomeStatementError> {
         let path = format!("/income-statements/{id}/summary-total");
-        let response = self.tenant_request(Method::GET, &path).await?.send().await?;
+        let response = self
+            .tenant_request(Method::GET, &path)
+            .await?
+            .send()
+            .await?;
 
         parse_response(response).await
     }

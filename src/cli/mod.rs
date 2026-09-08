@@ -8,9 +8,7 @@ use crate::{
     infrastructure::{
         api::EmsysApiClient,
         auth::FirebaseAuthClient,
-        income_statement::{
-            IncomeStatementSearchRequest, Pagination, Sort, SummaryTotalLine,
-        },
+        income_statement::{IncomeStatementSearchRequest, Pagination, Sort, SummaryTotalLine},
         session::SessionManager,
     },
 };
