@@ -314,6 +314,10 @@ impl IncomeStatementService {
         Ok(response.data)
     }
 
+    pub async fn set_statement_open(&self, id: u32, open: bool) -> anyhow::Result<IncomeStatement> {
+        Ok(self.api.set_income_statement_open(id, open).await?.data)
+    }
+
     async fn search_active_employees(&self) -> anyhow::Result<Vec<Employee>> {
         let response = self
             .api

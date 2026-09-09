@@ -20,7 +20,7 @@ use crate::{
     infrastructure::{
         api::EmsysApiClient,
         chart_account::ChartAccount,
-        income_statement::{IncomeStatementSummary, SummaryTotalLine},
+        income_statement::{IncomeStatement, IncomeStatementSummary, SummaryTotalLine},
         invoice::Invoice,
         journal::Journal,
     },
@@ -60,6 +60,20 @@ struct SubmitMessage {
     result: anyhow::Result<Journal>,
 }
 
+#[derive(Debug)]
+struct StatusMessage {
+    generation: u64,
+    result: anyhow::Result<IncomeStatement>,
+}
+
+#[derive(Debug, Clone)]
+struct StatusAction {
+    statement_id: u32,
+    open: bool,
+    error: Option<String>,
+    submitting: bool,
+}
+
 #[derive(Debug, Clone)]
 struct AddTransactionForm {
     values: JournalTransactionValues,
@@ -95,21 +109,26 @@ pub struct App {
     view_mode: ViewMode,
     load_generation: u64,
     submit_generation: u64,
+    status_generation: u64,
     load_started_at: Option<Instant>,
     active_target: LoadTarget,
     scroll_offset: u16,
     notice: Option<String>,
     add_form: Option<AddTransactionForm>,
+    status_action: Option<StatusAction>,
     loader_tx: mpsc::Sender<LoadMessage>,
     loader_rx: mpsc::Receiver<LoadMessage>,
     submit_tx: mpsc::Sender<SubmitMessage>,
     submit_rx: mpsc::Receiver<SubmitMessage>,
+    status_tx: mpsc::Sender<StatusMessage>,
+    status_rx: mpsc::Receiver<StatusMessage>,
 }
 
 impl App {
     pub fn new(context: AppContext) -> Self {
         let (loader_tx, loader_rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel();
+        let (status_tx, status_rx) = mpsc::channel();
 
         Self {
             context,
@@ -118,6 +137,7 @@ impl App {
             view_mode: ViewMode::Entries,
             load_generation: 0,
             submit_generation: 0,
+            status_generation: 0,
             load_started_at: None,
             active_target: LoadTarget {
                 statement_page: 1,
@@ -127,10 +147,13 @@ impl App {
             scroll_offset: 0,
             notice: None,
             add_form: None,
+            status_action: None,
             loader_tx,
             loader_rx,
             submit_tx,
             submit_rx,
+            status_tx,
+            status_rx,
         }
     }
 
@@ -141,6 +164,7 @@ impl App {
         while !self.should_quit {
             self.receive_loads();
             self.receive_submits();
+            self.receive_status_changes();
             terminal.draw(|frame| self.render(frame))?;
 
             if let Some(action) = event::next_action(Duration::from_millis(100))? {
@@ -157,6 +181,10 @@ impl App {
                 self.add_form = None;
                 self.notice = Some("Add transaction canceled.".into());
             }
+            Action::Quit if self.status_action.is_some() => {
+                self.status_action = None;
+                self.notice = Some("Status change canceled.".into());
+            }
             Action::Quit => self.should_quit = true,
             Action::FormNextField => self.form_next_field_or_scroll_down(),
             Action::FormPreviousField => self.form_previous_field_or_scroll_up(),
@@ -164,7 +192,7 @@ impl App {
             Action::FormPreviousChoice => self.form_previous_choice_or_statement(),
             Action::FormInput(value) => self.handle_character(value),
             Action::FormBackspace => self.form_backspace(),
-            Action::FormSubmit => self.form_submit(),
+            Action::FormSubmit => self.submit_active_prompt(),
             Action::ScrollEnd => self.scroll_offset = u16::MAX,
             Action::ScrollPageDown => {
                 self.scroll_offset = self.scroll_offset.saturating_add(PAGE_SCROLL)
@@ -259,6 +287,7 @@ impl App {
 
     fn open_add_transaction(&mut self) {
         if let ScreenState::Loaded(screen) = &self.state {
+            self.status_action = None;
             let mut values = JournalTransactionValues::default();
             values.employee_id = screen.lookups.employees.first().map(|employee| employee.id);
             values.account_id = first_account_id(&screen.lookups, values.transaction_type);
@@ -271,6 +300,21 @@ impl App {
             self.add_form = Some(AddTransactionForm {
                 values,
                 focus: 0,
+                error: None,
+                submitting: false,
+            });
+        }
+    }
+
+    fn open_status_action(&mut self) {
+        if let ScreenState::Loaded(screen) = &self.state {
+            let statement = &screen.detail.statement;
+            let open = !statement.status.eq_ignore_ascii_case("open");
+            self.add_form = None;
+            self.notice = None;
+            self.status_action = Some(StatusAction {
+                statement_id: statement.id,
+                open,
                 error: None,
                 submitting: false,
             });
@@ -320,8 +364,17 @@ impl App {
             return;
         }
 
+        if self.status_action.is_some() {
+            if value == 'q' {
+                self.status_action = None;
+                self.notice = Some("Status change canceled.".into());
+            }
+            return;
+        }
+
         match value {
             'a' => self.open_add_transaction(),
+            'c' => self.open_status_action(),
             'e' => self.set_view_mode(ViewMode::Entries),
             'j' => self.scroll_offset = self.scroll_offset.saturating_add(1),
             'k' => self.scroll_offset = self.scroll_offset.saturating_sub(1),
@@ -512,6 +565,40 @@ impl App {
         });
     }
 
+    fn submit_active_prompt(&mut self) {
+        if self.add_form.is_some() {
+            self.form_submit();
+        } else if self.status_action.is_some() {
+            self.status_submit();
+        }
+    }
+
+    fn status_submit(&mut self) {
+        let Some(status_action) = self.status_action.as_mut() else {
+            return;
+        };
+        if status_action.submitting {
+            return;
+        }
+
+        self.status_generation += 1;
+        status_action.submitting = true;
+        status_action.error = None;
+
+        let generation = self.status_generation;
+        let sender = self.status_tx.clone();
+        let config = self.context.config.clone();
+        let statement_id = status_action.statement_id;
+        let open = status_action.open;
+
+        tokio::spawn(async move {
+            let api = EmsysApiClient::new(&config);
+            let service = IncomeStatementService::new(api);
+            let result = service.set_statement_open(statement_id, open).await;
+            let _ = sender.send(StatusMessage { generation, result });
+        });
+    }
+
     fn load(&mut self, target: LoadTarget) {
         self.load_generation += 1;
         self.load_started_at = Some(Instant::now());
@@ -586,6 +673,32 @@ impl App {
         }
     }
 
+    fn receive_status_changes(&mut self) {
+        while let Ok(message) = self.status_rx.try_recv() {
+            if message.generation != self.status_generation {
+                continue;
+            }
+
+            match message.result {
+                Ok(statement) => {
+                    let status = status_label(&statement.status);
+                    self.status_action = None;
+                    self.notice = Some(format!(
+                        "Income statement #{} is now {status}.",
+                        statement.id
+                    ));
+                    self.load(self.current_target());
+                }
+                Err(error) => {
+                    if let Some(status_action) = self.status_action.as_mut() {
+                        status_action.submitting = false;
+                        status_action.error = Some(safe_error_message(error));
+                    }
+                }
+            }
+        }
+    }
+
     fn render(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
         let chunks = Layout::default()
@@ -622,6 +735,7 @@ impl App {
             self.view_mode,
             self.scroll_offset,
             self.add_form.as_ref(),
+            self.status_action.as_ref(),
         ))
         .block(Block::default().title(" Keys ").borders(Borders::ALL));
         frame.render_widget(Clear, chunks[3]);
@@ -652,6 +766,11 @@ impl App {
             (
                 add_form_lines(screen, form, body_width),
                 " Add Journal Transaction ",
+            )
+        } else if let Some(status_action) = &self.status_action {
+            (
+                status_action_lines(screen, status_action, body_width),
+                " Change Statement Status ",
             )
         } else {
             match self.view_mode {
@@ -941,6 +1060,51 @@ fn add_form_lines(
     lines
 }
 
+fn status_action_lines(
+    screen: &IncomeStatementScreen,
+    status_action: &StatusAction,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let statement = &screen.detail.statement;
+    let action = if status_action.open { "open" } else { "close" };
+    let mut lines = vec![
+        Line::from(format!(
+            "Income statement #{} is currently {}.",
+            statement.id,
+            status_label(&statement.status)
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("Press "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" to {action} this income statement.")),
+        ]),
+        Line::from(vec![
+            Span::raw("Press "),
+            Span::styled("q/Esc", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" to cancel."),
+        ]),
+    ];
+
+    if status_action.submitting {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("Saving {action} action..."),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    if let Some(error) = &status_action.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            truncate(error, width),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    lines
+}
+
 fn merged_area(top: Rect, bottom: Rect) -> Rect {
     Rect {
         x: top.x,
@@ -1077,7 +1241,20 @@ fn key_menu_lines(
     view_mode: ViewMode,
     scroll_offset: u16,
     add_form: Option<&AddTransactionForm>,
+    status_action: Option<&StatusAction>,
 ) -> Vec<Line<'static>> {
+    if status_action.is_some() {
+        return vec![
+            Line::from(vec![
+                Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Confirm   "),
+                Span::styled("q/Esc", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Cancel"),
+            ]),
+            Line::from(""),
+        ];
+    }
+
     if add_form.is_some() {
         return vec![
             Line::from(vec![
@@ -1110,6 +1287,15 @@ fn key_menu_lines(
         ),
         _ => "Loading".to_string(),
     };
+    let status_action_label = match state {
+        ScreenState::Loaded(screen)
+            if screen.detail.statement.status.eq_ignore_ascii_case("open") =>
+        {
+            "Close"
+        }
+        ScreenState::Loaded(_) => "Open",
+        _ => "Close/Open",
+    };
     let toggle = match view_mode {
         ViewMode::Entries => ("t", "Totals"),
         ViewMode::Totals => ("e", "Entries"),
@@ -1123,6 +1309,8 @@ fn key_menu_lines(
             Span::raw(" Journal page   "),
             Span::styled("a", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Add   "),
+            Span::styled("c", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" {status_action_label}   ")),
             Span::styled(toggle.0, Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!(" {}   ", toggle.1)),
             Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
@@ -1592,6 +1780,17 @@ mod tests {
         assert!(line_contains(&visible[1], "three"));
     }
 
+    #[test]
+    fn key_menu_labels_status_toggle_action() {
+        let closed_screen = ScreenState::Loaded(Box::new(screen_with_status("closed")));
+        let closed_lines = key_menu_lines(&closed_screen, ViewMode::Entries, 0, None, None);
+        assert!(line_contains(&closed_lines[0], "Open"));
+
+        let open_screen = ScreenState::Loaded(Box::new(screen_with_status("open")));
+        let open_lines = key_menu_lines(&open_screen, ViewMode::Entries, 0, None, None);
+        assert!(line_contains(&open_lines[0], "Close"));
+    }
+
     fn line_contains(line: &Line<'_>, expected: &str) -> bool {
         line.spans
             .iter()
@@ -1651,5 +1850,12 @@ mod tests {
             },
             lookups: TransactionLookups::default(),
         }
+    }
+
+    fn screen_with_status(status: &str) -> IncomeStatementScreen {
+        let mut screen = screen_with_statement_page(1, 0, 20, 1);
+        screen.statements[0].status = status.into();
+        screen.detail.statement.status = status.into();
+        screen
     }
 }

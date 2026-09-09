@@ -8,6 +8,7 @@ use crate::infrastructure::{
 };
 
 const INCOME_STATEMENT_SEARCH_PATH: &str = "/income-statements/search";
+const INCOME_STATEMENT_PATH: &str = "/income-statements";
 
 pub type IncomeStatementSearchRequest = QueryRequest;
 
@@ -212,9 +213,24 @@ impl EmsysApiClient {
         &self,
         id: u32,
     ) -> Result<IncomeStatementResponse, IncomeStatementError> {
-        let path = format!("/income-statements/{id}");
+        let path = format!("{INCOME_STATEMENT_PATH}/{id}");
         let response = self
             .tenant_request(Method::GET, &path)
+            .await?
+            .send()
+            .await?;
+
+        parse_response(response).await
+    }
+
+    pub async fn set_income_statement_open(
+        &self,
+        id: u32,
+        open: bool,
+    ) -> Result<IncomeStatementResponse, IncomeStatementError> {
+        let path = income_statement_status_path(id, open);
+        let response = self
+            .tenant_request(Method::POST, &path)
             .await?
             .send()
             .await?;
@@ -235,6 +251,11 @@ impl EmsysApiClient {
 
         parse_response(response).await
     }
+}
+
+fn income_statement_status_path(id: u32, open: bool) -> String {
+    let action = if open { "open" } else { "close" };
+    format!("{INCOME_STATEMENT_PATH}/{id}/{action}")
 }
 
 async fn parse_response<T>(response: reqwest::Response) -> Result<T, IncomeStatementError>
@@ -299,6 +320,18 @@ mod tests {
         assert_eq!(value["pagination"]["limit"], 40);
         assert_eq!(value["sort"][0]["field"], "date");
         assert_eq!(value["sort"][0]["direction"], "desc");
+    }
+
+    #[test]
+    fn builds_status_action_paths() {
+        assert_eq!(
+            income_statement_status_path(7, true),
+            "/income-statements/7/open"
+        );
+        assert_eq!(
+            income_statement_status_path(7, false),
+            "/income-statements/7/close"
+        );
     }
 
     #[test]
