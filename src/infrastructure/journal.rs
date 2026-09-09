@@ -1,5 +1,5 @@
 use reqwest::Method;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -9,6 +9,7 @@ use crate::infrastructure::{
 };
 
 const JOURNAL_SEARCH_PATH: &str = "/journals/search";
+const JOURNAL_PATH: &str = "/journals";
 
 pub type JournalSearchRequest = QueryRequest;
 
@@ -31,6 +32,84 @@ pub struct JournalSearchResponse {
     pub total: u64,
     #[serde(default)]
     pub subtotal: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PostJournalRequest {
+    pub transaction_type: String,
+    pub income_statement_id: u32,
+    pub income_statement: IncomeStatementPostReference,
+    pub date: String,
+    pub amount: f64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ref_number: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub currency: String,
+    pub rate: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub employee: Option<EmployeePostReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountPostReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_account: Option<AccountPostReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_account: Option<AccountPostReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invoice_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invoice: Option<InvoicePostReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_method: Option<PaymentMethod>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zelle_transaction_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zelle_transaction_name: Option<String>,
+    #[serde(rename = "checkNumber", skip_serializing_if = "Option::is_none")]
+    pub check_number: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomeStatementPostReference {
+    pub id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EmployeePostReference {
+    pub id: u16,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountPostReference {
+    pub id: u32,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub account_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InvoicePostReference {
+    pub number: String,
+    pub cost: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub discount: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PostJournalResponse {
+    pub success: bool,
+    pub message: String,
+    pub data: Journal,
+    #[serde(default)]
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -69,7 +148,7 @@ pub struct Journal {
     pub transaction_balance: f64,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PaymentMethod {
     #[serde(default)]
@@ -181,6 +260,24 @@ impl EmsysApiClient {
 
         parse_response(response).await
     }
+
+    pub async fn post_journal(
+        &self,
+        request: &PostJournalRequest,
+    ) -> Result<PostJournalResponse, JournalError> {
+        let response = self
+            .tenant_request(Method::POST, JOURNAL_PATH)
+            .await?
+            .json(request)
+            .send()
+            .await?;
+
+        parse_response(response).await
+    }
+}
+
+fn is_zero(value: &f64) -> bool {
+    value.abs() < f64::EPSILON
 }
 
 async fn parse_response<T>(response: reqwest::Response) -> Result<T, JournalError>
@@ -299,5 +396,52 @@ mod tests {
 
         assert!(response.data.is_empty());
         assert_eq!(response.total, 0);
+    }
+
+    #[test]
+    fn serializes_post_journal_request_using_portal_contract() {
+        let request = PostJournalRequest {
+            transaction_type: "PAYMENT".into(),
+            income_statement_id: 32658,
+            income_statement: IncomeStatementPostReference { id: 32658 },
+            date: "2026-09-09T00:00:00Z".into(),
+            amount: 25.0,
+            ref_number: String::new(),
+            description: "Payment".into(),
+            currency: "USD".into(),
+            rate: 1.0,
+            employee: Some(EmployeePostReference {
+                id: 7,
+                name: "Ada".into(),
+            }),
+            account: None,
+            payment_account: Some(AccountPostReference {
+                id: 20,
+                name: "Checking".into(),
+                account_type: "BANK".into(),
+            }),
+            source_account: None,
+            invoice_id: Some("inv-1".into()),
+            invoice: None,
+            payment_method: Some(PaymentMethod {
+                id: 4,
+                name: "ZELLE".into(),
+            }),
+            zelle_transaction_date: Some("2026-09-09".into()),
+            zelle_transaction_name: Some("Zelle Ref".into()),
+            check_number: None,
+        };
+
+        let value = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(value["transactionType"], "PAYMENT");
+        assert_eq!(value["incomeStatementId"], 32658);
+        assert_eq!(value["incomeStatement"]["id"], 32658);
+        assert_eq!(value["paymentAccount"]["type"], "BANK");
+        assert_eq!(value["invoiceId"], "inv-1");
+        assert_eq!(value["paymentMethod"]["name"], "ZELLE");
+        assert_eq!(value["zelleTransactionName"], "Zelle Ref");
+        assert!(value.get("refNumber").is_none());
+        assert!(value.get("checkNumber").is_none());
     }
 }

@@ -12,11 +12,16 @@ use ratatui::{
 };
 
 use crate::{
-    application::income_statement::{IncomeStatementScreen, IncomeStatementService, JournalPage},
+    application::income_statement::{
+        IncomeStatementScreen, IncomeStatementService, JournalPage, JournalTransactionType,
+        JournalTransactionValues, TransactionLookups,
+    },
     context::AppContext,
     infrastructure::{
         api::EmsysApiClient,
+        chart_account::ChartAccount,
         income_statement::{IncomeStatementSummary, SummaryTotalLine},
+        invoice::Invoice,
         journal::Journal,
     },
     tui::{action::Action, event, terminal::TerminalSession},
@@ -49,22 +54,62 @@ struct LoadMessage {
     result: anyhow::Result<IncomeStatementScreen>,
 }
 
+#[derive(Debug)]
+struct SubmitMessage {
+    generation: u64,
+    result: anyhow::Result<Journal>,
+}
+
+#[derive(Debug, Clone)]
+struct AddTransactionForm {
+    values: JournalTransactionValues,
+    focus: usize,
+    error: Option<String>,
+    submitting: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormField {
+    TransactionType,
+    Employee,
+    Invoice,
+    InvoiceNumber,
+    InvoiceCost,
+    InvoiceDiscount,
+    PaymentMethod,
+    PaymentAccount,
+    ZelleDate,
+    ZelleName,
+    CheckNumber,
+    Account,
+    SourceAccount,
+    Amount,
+    RefNumber,
+    Description,
+}
+
 pub struct App {
     context: AppContext,
     should_quit: bool,
     state: ScreenState,
     view_mode: ViewMode,
     load_generation: u64,
+    submit_generation: u64,
     load_started_at: Option<Instant>,
     active_target: LoadTarget,
     scroll_offset: u16,
+    notice: Option<String>,
+    add_form: Option<AddTransactionForm>,
     loader_tx: mpsc::Sender<LoadMessage>,
     loader_rx: mpsc::Receiver<LoadMessage>,
+    submit_tx: mpsc::Sender<SubmitMessage>,
+    submit_rx: mpsc::Receiver<SubmitMessage>,
 }
 
 impl App {
     pub fn new(context: AppContext) -> Self {
         let (loader_tx, loader_rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
 
         Self {
             context,
@@ -72,6 +117,7 @@ impl App {
             state: ScreenState::Loading,
             view_mode: ViewMode::Entries,
             load_generation: 0,
+            submit_generation: 0,
             load_started_at: None,
             active_target: LoadTarget {
                 statement_page: 1,
@@ -79,8 +125,12 @@ impl App {
                 journal_page: 1,
             },
             scroll_offset: 0,
+            notice: None,
+            add_form: None,
             loader_tx,
             loader_rx,
+            submit_tx,
+            submit_rx,
         }
     }
 
@@ -90,6 +140,7 @@ impl App {
 
         while !self.should_quit {
             self.receive_loads();
+            self.receive_submits();
             terminal.draw(|frame| self.render(frame))?;
 
             if let Some(action) = event::next_action(Duration::from_millis(100))? {
@@ -102,15 +153,18 @@ impl App {
 
     fn handle_action(&mut self, action: Action) {
         match action {
+            Action::Quit if self.add_form.is_some() => {
+                self.add_form = None;
+                self.notice = Some("Add transaction canceled.".into());
+            }
             Action::Quit => self.should_quit = true,
-            Action::Refresh => self.load(self.current_target()),
-            Action::JournalNextPage => self.next_journal_page(),
-            Action::JournalPreviousPage => self.previous_journal_page(),
-            Action::SelectNextStatement => self.select_next_statement(),
-            Action::SelectPreviousStatement => self.select_previous_statement(),
-            Action::ShowEntries => self.set_view_mode(ViewMode::Entries),
-            Action::ShowTotals => self.set_view_mode(ViewMode::Totals),
-            Action::ScrollDown => self.scroll_offset = self.scroll_offset.saturating_add(1),
+            Action::FormNextField => self.form_next_field_or_scroll_down(),
+            Action::FormPreviousField => self.form_previous_field_or_scroll_up(),
+            Action::FormNextChoice => self.form_next_choice_or_statement(),
+            Action::FormPreviousChoice => self.form_previous_choice_or_statement(),
+            Action::FormInput(value) => self.handle_character(value),
+            Action::FormBackspace => self.form_backspace(),
+            Action::FormSubmit => self.form_submit(),
             Action::ScrollEnd => self.scroll_offset = u16::MAX,
             Action::ScrollPageDown => {
                 self.scroll_offset = self.scroll_offset.saturating_add(PAGE_SCROLL)
@@ -119,7 +173,6 @@ impl App {
                 self.scroll_offset = self.scroll_offset.saturating_sub(PAGE_SCROLL)
             }
             Action::ScrollStart => self.scroll_offset = 0,
-            Action::ScrollUp => self.scroll_offset = self.scroll_offset.saturating_sub(1),
         }
     }
 
@@ -204,6 +257,261 @@ impl App {
         }
     }
 
+    fn open_add_transaction(&mut self) {
+        if let ScreenState::Loaded(screen) = &self.state {
+            let mut values = JournalTransactionValues::default();
+            values.employee_id = screen.lookups.employees.first().map(|employee| employee.id);
+            values.account_id = first_account_id(&screen.lookups, values.transaction_type);
+            values.source_account_id = first_source_account_id(&screen.lookups);
+            values.payment_account_id = first_payment_account_id(&screen.lookups);
+            values.invoice_id = screen.lookups.invoices.first().map(Invoice::id_string);
+            values.zelle_transaction_date = short_date(&screen.detail.statement.date);
+
+            self.notice = None;
+            self.add_form = Some(AddTransactionForm {
+                values,
+                focus: 0,
+                error: None,
+                submitting: false,
+            });
+        }
+    }
+
+    fn form_next_field_or_scroll_down(&mut self) {
+        if self.add_form.is_some() {
+            self.move_form_focus(1);
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_add(1);
+        }
+    }
+
+    fn form_previous_field_or_scroll_up(&mut self) {
+        if self.add_form.is_some() {
+            self.move_form_focus(-1);
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        }
+    }
+
+    fn form_next_choice_or_statement(&mut self) {
+        if self.add_form.is_some() {
+            self.change_form_choice(1);
+        } else {
+            self.select_next_statement();
+        }
+    }
+
+    fn form_previous_choice_or_statement(&mut self) {
+        if self.add_form.is_some() {
+            self.change_form_choice(-1);
+        } else {
+            self.select_previous_statement();
+        }
+    }
+
+    fn handle_character(&mut self, value: char) {
+        if self.add_form.is_some() {
+            if value == 'q' {
+                self.add_form = None;
+                self.notice = Some("Add transaction canceled.".into());
+            } else {
+                self.form_input(value);
+            }
+            return;
+        }
+
+        match value {
+            'a' => self.open_add_transaction(),
+            'e' => self.set_view_mode(ViewMode::Entries),
+            'j' => self.scroll_offset = self.scroll_offset.saturating_add(1),
+            'k' => self.scroll_offset = self.scroll_offset.saturating_sub(1),
+            'n' => self.next_journal_page(),
+            'p' => self.previous_journal_page(),
+            'q' => self.should_quit = true,
+            'r' => self.load(self.current_target()),
+            't' => self.set_view_mode(ViewMode::Totals),
+            _ => {}
+        }
+    }
+
+    fn move_form_focus(&mut self, step: isize) {
+        let Some(form) = self.add_form.as_mut() else {
+            return;
+        };
+        let ScreenState::Loaded(screen) = &self.state else {
+            return;
+        };
+        let fields = form_fields(&form.values, &screen.lookups);
+        form.focus = shifted_index(form.focus, fields.len(), step);
+    }
+
+    fn change_form_choice(&mut self, step: isize) {
+        let Some(form) = self.add_form.as_mut() else {
+            return;
+        };
+        let ScreenState::Loaded(screen) = &self.state else {
+            return;
+        };
+        let fields = form_fields(&form.values, &screen.lookups);
+        let Some(field) = fields.get(form.focus).copied() else {
+            return;
+        };
+
+        match field {
+            FormField::TransactionType => {
+                let all = JournalTransactionType::all();
+                let current = all
+                    .iter()
+                    .position(|value| *value == form.values.transaction_type)
+                    .unwrap_or_default();
+                form.values.transaction_type = all[shifted_index(current, all.len(), step)];
+                form.values.account_id =
+                    first_account_id(&screen.lookups, form.values.transaction_type);
+                form.values.source_account_id = first_source_account_id(&screen.lookups);
+                form.values.payment_account_id = first_payment_account_id(&screen.lookups);
+                form.focus = form
+                    .focus
+                    .min(form_fields(&form.values, &screen.lookups).len() - 1);
+            }
+            FormField::Employee => {
+                form.values.employee_id =
+                    cycle_employee(&screen.lookups, form.values.employee_id, step);
+            }
+            FormField::Invoice => {
+                form.values.invoice_id =
+                    cycle_invoice(&screen.lookups, form.values.invoice_id.as_deref(), step);
+            }
+            FormField::PaymentMethod => {
+                form.values.payment_method_id =
+                    cycle_payment_method(&screen.lookups, form.values.payment_method_id, step);
+            }
+            FormField::PaymentAccount => {
+                form.values.payment_account_id = cycle_account(
+                    bank_accounts(&screen.lookups),
+                    form.values.payment_account_id,
+                    step,
+                );
+            }
+            FormField::Account => {
+                form.values.account_id = cycle_account(
+                    account_options(&screen.lookups, form.values.transaction_type),
+                    form.values.account_id,
+                    step,
+                );
+            }
+            FormField::SourceAccount => {
+                form.values.source_account_id = cycle_account(
+                    asset_accounts(&screen.lookups),
+                    form.values.source_account_id,
+                    step,
+                );
+            }
+            _ => {}
+        }
+        form.error = None;
+    }
+
+    fn form_input(&mut self, value: char) {
+        let Some(form) = self.add_form.as_mut() else {
+            return;
+        };
+        if form.submitting || value.is_control() {
+            return;
+        }
+        let ScreenState::Loaded(screen) = &self.state else {
+            return;
+        };
+        let fields = form_fields(&form.values, &screen.lookups);
+        let Some(field) = fields.get(form.focus).copied() else {
+            return;
+        };
+
+        match field {
+            FormField::Amount => push_number(&mut form.values.amount, value),
+            FormField::InvoiceCost => push_number(&mut form.values.invoice_cost, value),
+            FormField::InvoiceDiscount => push_number(&mut form.values.invoice_discount, value),
+            FormField::InvoiceNumber => form.values.invoice_number.push(value),
+            FormField::RefNumber => form.values.ref_number.push(value),
+            FormField::Description => form.values.description.push(value),
+            FormField::ZelleDate => form.values.zelle_transaction_date.push(value),
+            FormField::ZelleName => form.values.zelle_transaction_name.push(value),
+            FormField::CheckNumber => form.values.check_number.push(value),
+            _ => {}
+        }
+        form.error = None;
+    }
+
+    fn form_backspace(&mut self) {
+        let Some(form) = self.add_form.as_mut() else {
+            return;
+        };
+        let ScreenState::Loaded(screen) = &self.state else {
+            return;
+        };
+        let fields = form_fields(&form.values, &screen.lookups);
+        let Some(field) = fields.get(form.focus).copied() else {
+            return;
+        };
+
+        match field {
+            FormField::Amount => pop_number(&mut form.values.amount),
+            FormField::InvoiceCost => pop_number(&mut form.values.invoice_cost),
+            FormField::InvoiceDiscount => pop_number(&mut form.values.invoice_discount),
+            FormField::InvoiceNumber => {
+                form.values.invoice_number.pop();
+            }
+            FormField::RefNumber => {
+                form.values.ref_number.pop();
+            }
+            FormField::Description => {
+                form.values.description.pop();
+            }
+            FormField::ZelleDate => {
+                form.values.zelle_transaction_date.pop();
+            }
+            FormField::ZelleName => {
+                form.values.zelle_transaction_name.pop();
+            }
+            FormField::CheckNumber => {
+                form.values.check_number.pop();
+            }
+            _ => {}
+        }
+        form.error = None;
+    }
+
+    fn form_submit(&mut self) {
+        let Some(form) = self.add_form.as_mut() else {
+            return;
+        };
+        if form.submitting {
+            return;
+        }
+        let ScreenState::Loaded(screen) = &self.state else {
+            return;
+        };
+
+        self.submit_generation += 1;
+        form.submitting = true;
+        form.error = None;
+
+        let generation = self.submit_generation;
+        let sender = self.submit_tx.clone();
+        let config = self.context.config.clone();
+        let statement = screen.detail.statement.clone();
+        let lookups = screen.lookups.clone();
+        let values = form.values.clone();
+
+        tokio::spawn(async move {
+            let api = EmsysApiClient::new(&config);
+            let service = IncomeStatementService::new(api);
+            let result = service
+                .post_transaction(&statement, &lookups, &values)
+                .await;
+            let _ = sender.send(SubmitMessage { generation, result });
+        });
+    }
+
     fn load(&mut self, target: LoadTarget) {
         self.load_generation += 1;
         self.load_started_at = Some(Instant::now());
@@ -249,6 +557,35 @@ impl App {
         }
     }
 
+    fn receive_submits(&mut self) {
+        while let Ok(message) = self.submit_rx.try_recv() {
+            if message.generation != self.submit_generation {
+                continue;
+            }
+
+            match message.result {
+                Ok(journal) => {
+                    self.add_form = None;
+                    self.notice = Some(format!(
+                        "Created {} journal transaction for {}.",
+                        type_label(&journal.transaction_type),
+                        format_money(journal.transaction_amount)
+                    ));
+                    self.load(LoadTarget {
+                        journal_page: 1,
+                        ..self.current_target()
+                    });
+                }
+                Err(error) => {
+                    if let Some(form) = self.add_form.as_mut() {
+                        form.submitting = false;
+                        form.error = Some(safe_error_message(error));
+                    }
+                }
+            }
+        }
+    }
+
     fn render(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
         let chunks = Layout::default()
@@ -284,6 +621,7 @@ impl App {
             &self.state,
             self.view_mode,
             self.scroll_offset,
+            self.add_form.as_ref(),
         ))
         .block(Block::default().title(" Keys ").borders(Borders::ALL));
         frame.render_widget(Clear, chunks[3]);
@@ -296,7 +634,12 @@ impl App {
         chunks: &[Rect],
         screen: &IncomeStatementScreen,
     ) {
-        let metadata = Paragraph::new(metadata_lines(screen, self.view_mode)).block(
+        let metadata = Paragraph::new(metadata_lines(
+            screen,
+            self.view_mode,
+            self.notice.as_deref(),
+        ))
+        .block(
             Block::default()
                 .title(" Statement ")
                 .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM),
@@ -305,15 +648,21 @@ impl App {
         frame.render_widget(metadata, chunks[1]);
 
         let body_width = chunks[2].width.saturating_sub(2).max(20) as usize;
-        let body_lines = match self.view_mode {
-            ViewMode::Entries => journal_lines(screen, body_width),
-            ViewMode::Totals => summary_lines(&screen.detail.summary, body_width),
+        let (body_lines, title) = if let Some(form) = &self.add_form {
+            (
+                add_form_lines(screen, form, body_width),
+                " Add Journal Transaction ",
+            )
+        } else {
+            match self.view_mode {
+                ViewMode::Entries => (journal_lines(screen, body_width), " Journal Entries "),
+                ViewMode::Totals => (
+                    summary_lines(&screen.detail.summary, body_width),
+                    " Income Totals ",
+                ),
+            }
         };
         let scroll_offset = scroll_offset(self.scroll_offset, body_lines.len(), chunks[2].height);
-        let title = match self.view_mode {
-            ViewMode::Entries => " Journal Entries ",
-            ViewMode::Totals => " Income Totals ",
-        };
 
         let body = Paragraph::new(visible_lines(body_lines, scroll_offset, chunks[2].height))
             .block(
@@ -374,7 +723,11 @@ fn status_lines(state: &ScreenState, load_started_at: Option<Instant>) -> Vec<Li
     }
 }
 
-fn metadata_lines(screen: &IncomeStatementScreen, view_mode: ViewMode) -> Vec<Line<'static>> {
+fn metadata_lines(
+    screen: &IncomeStatementScreen,
+    view_mode: ViewMode,
+    notice: Option<&str>,
+) -> Vec<Line<'static>> {
     let statement = &screen.detail.statement;
     let summary = &screen.detail.summary;
     let branch = statement
@@ -395,7 +748,7 @@ fn metadata_lines(screen: &IncomeStatementScreen, view_mode: ViewMode) -> Vec<Li
         ViewMode::Totals => "Totals",
     };
 
-    vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("Statement: ", Style::default().fg(Color::Gray)),
             Span::raw(format!(
@@ -421,7 +774,16 @@ fn metadata_lines(screen: &IncomeStatementScreen, view_mode: ViewMode) -> Vec<Li
             Span::styled("Currency: ", Style::default().fg(Color::Gray)),
             Span::raw(currency.to_string()),
         ]),
-    ]
+    ];
+
+    if let Some(notice) = notice {
+        lines.push(Line::from(Span::styled(
+            truncate(notice, 90),
+            Style::default().fg(Color::Green),
+        )));
+    }
+
+    lines
 }
 
 fn journal_lines(screen: &IncomeStatementScreen, width: usize) -> Vec<Line<'static>> {
@@ -525,6 +887,60 @@ fn summary_lines(summary: &IncomeStatementSummary, width: usize) -> Vec<Line<'st
     lines
 }
 
+fn add_form_lines(
+    screen: &IncomeStatementScreen,
+    form: &AddTransactionForm,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let fields = form_fields(&form.values, &screen.lookups);
+    let mut lines = vec![
+        Line::from(format!(
+            "Statement #{} on {} ({})",
+            screen.detail.statement.id,
+            short_date(&screen.detail.statement.date),
+            status_label(&screen.detail.statement.status)
+        )),
+        Line::from(""),
+    ];
+
+    if form.submitting {
+        lines.push(Line::from(Span::styled(
+            "Saving transaction...",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    if let Some(error) = &form.error {
+        lines.push(Line::from(Span::styled(
+            truncate(error, width),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    for (index, field) in fields.iter().enumerate() {
+        let selected = index == form.focus;
+        let marker = if selected { "> " } else { "  " };
+        let label = field_label(*field);
+        let value = field_value(*field, &form.values, &screen.lookups);
+        let style = if selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(format!("{label:<18}"), style),
+            Span::raw(truncate(&value, width.saturating_sub(22).max(8))),
+        ]));
+    }
+
+    lines
+}
+
 fn merged_area(top: Rect, bottom: Rect) -> Rect {
     Rect {
         x: top.x,
@@ -595,6 +1011,14 @@ fn status_label(status: &str) -> String {
     }
 }
 
+fn type_label(transaction_type: &str) -> String {
+    transaction_type
+        .split('-')
+        .map(status_label)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn format_money(value: f64) -> String {
     format!("${value:.2}")
 }
@@ -652,7 +1076,31 @@ fn key_menu_lines(
     state: &ScreenState,
     view_mode: ViewMode,
     scroll_offset: u16,
+    add_form: Option<&AddTransactionForm>,
 ) -> Vec<Line<'static>> {
+    if add_form.is_some() {
+        return vec![
+            Line::from(vec![
+                Span::styled("a", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Add   "),
+                Span::styled("Tab/Up/Down", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Field   "),
+                Span::styled("Left/Right", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Choice   "),
+                Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Save"),
+            ]),
+            Line::from(vec![
+                Span::styled("Type", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Text   "),
+                Span::styled("Backspace", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Delete   "),
+                Span::styled("q/Esc", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" Cancel"),
+            ]),
+        ];
+    }
+
     let page_label = match state {
         ScreenState::Loaded(screen) => format!(
             "S {}/{} J {}",
@@ -673,6 +1121,8 @@ fn key_menu_lines(
             Span::raw(" Statement   "),
             Span::styled("p/n", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Journal page   "),
+            Span::styled("a", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Add   "),
             Span::styled(toggle.0, Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!(" {}   ", toggle.1)),
             Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
@@ -691,6 +1141,299 @@ fn key_menu_lines(
             ),
         ]),
     ]
+}
+
+fn form_fields(values: &JournalTransactionValues, lookups: &TransactionLookups) -> Vec<FormField> {
+    let transaction_type = values.transaction_type;
+    let mut fields = vec![FormField::TransactionType, FormField::Employee];
+
+    if transaction_type.needs_existing_invoice() {
+        fields.push(FormField::Invoice);
+    }
+
+    if matches!(transaction_type, JournalTransactionType::InitialPayment) {
+        fields.extend([
+            FormField::InvoiceNumber,
+            FormField::InvoiceCost,
+            FormField::InvoiceDiscount,
+        ]);
+    }
+
+    if transaction_type.needs_payment_method() {
+        fields.push(FormField::PaymentMethod);
+        if selected_payment_method(lookups, values.payment_method_id)
+            .is_some_and(|method| matches!(method.name.as_str(), "DEPOSIT" | "ZELLE"))
+        {
+            fields.push(FormField::PaymentAccount);
+        }
+        if selected_payment_method(lookups, values.payment_method_id)
+            .is_some_and(|method| method.name == "ZELLE")
+        {
+            fields.extend([FormField::ZelleDate, FormField::ZelleName]);
+        }
+        if selected_payment_method(lookups, values.payment_method_id)
+            .is_some_and(|method| method.name == "CHECK")
+        {
+            fields.push(FormField::CheckNumber);
+        }
+    }
+
+    if transaction_type.needs_account() {
+        fields.push(FormField::Account);
+    }
+    if transaction_type.needs_source_account() {
+        fields.push(FormField::SourceAccount);
+    }
+
+    fields.extend([
+        FormField::Amount,
+        FormField::RefNumber,
+        FormField::Description,
+    ]);
+    fields
+}
+
+fn field_label(field: FormField) -> &'static str {
+    match field {
+        FormField::TransactionType => "Type",
+        FormField::Employee => "Employee",
+        FormField::Invoice => "Invoice",
+        FormField::InvoiceNumber => "Invoice number",
+        FormField::InvoiceCost => "Invoice cost",
+        FormField::InvoiceDiscount => "Invoice discount",
+        FormField::PaymentMethod => "Payment method",
+        FormField::PaymentAccount => "Bank account",
+        FormField::ZelleDate => "Zelle date",
+        FormField::ZelleName => "Zelle name",
+        FormField::CheckNumber => "Check number",
+        FormField::Account => "Account",
+        FormField::SourceAccount => "Source account",
+        FormField::Amount => "Amount",
+        FormField::RefNumber => "Reference",
+        FormField::Description => "Description",
+    }
+}
+
+fn field_value(
+    field: FormField,
+    values: &JournalTransactionValues,
+    lookups: &TransactionLookups,
+) -> String {
+    match field {
+        FormField::TransactionType => values.transaction_type.label().into(),
+        FormField::Employee => lookups
+            .employees
+            .iter()
+            .find(|employee| Some(employee.id) == values.employee_id)
+            .map(|employee| employee.name.clone())
+            .unwrap_or_else(|| "(none)".into()),
+        FormField::Invoice => lookups
+            .invoices
+            .iter()
+            .find(|invoice| Some(invoice.id_string()) == values.invoice_id)
+            .map(invoice_label)
+            .unwrap_or_else(|| "(none)".into()),
+        FormField::InvoiceNumber => values.invoice_number.clone(),
+        FormField::InvoiceCost => decimal_value(values.invoice_cost),
+        FormField::InvoiceDiscount => decimal_value(values.invoice_discount),
+        FormField::PaymentMethod => selected_payment_method(lookups, values.payment_method_id)
+            .map(|method| method.name.clone())
+            .unwrap_or_else(|| "(none)".into()),
+        FormField::PaymentAccount => account_label(lookups, values.payment_account_id),
+        FormField::ZelleDate => values.zelle_transaction_date.clone(),
+        FormField::ZelleName => values.zelle_transaction_name.clone(),
+        FormField::CheckNumber => values.check_number.clone(),
+        FormField::Account => account_label(lookups, values.account_id),
+        FormField::SourceAccount => account_label(lookups, values.source_account_id),
+        FormField::Amount => decimal_value(values.amount),
+        FormField::RefNumber => values.ref_number.clone(),
+        FormField::Description => values.description.clone(),
+    }
+}
+
+fn account_label(lookups: &TransactionLookups, id: Option<u32>) -> String {
+    lookups
+        .accounts
+        .iter()
+        .find(|account| Some(account.id) == id)
+        .map(|account| account.label())
+        .unwrap_or_else(|| "(none)".into())
+}
+
+fn invoice_label(invoice: &Invoice) -> String {
+    format!(
+        "{}  balance {}",
+        invoice.number,
+        format_money(invoice.balance)
+    )
+}
+
+fn selected_payment_method(
+    lookups: &TransactionLookups,
+    id: Option<u16>,
+) -> Option<&crate::infrastructure::journal::PaymentMethod> {
+    lookups
+        .payment_methods
+        .iter()
+        .find(|method| Some(method.id) == id)
+}
+
+fn first_account_id(
+    lookups: &TransactionLookups,
+    transaction_type: JournalTransactionType,
+) -> Option<u32> {
+    account_options(lookups, transaction_type)
+        .first()
+        .map(|account| account.id)
+}
+
+fn first_source_account_id(lookups: &TransactionLookups) -> Option<u32> {
+    asset_accounts(lookups).first().map(|account| account.id)
+}
+
+fn first_payment_account_id(lookups: &TransactionLookups) -> Option<u32> {
+    bank_accounts(lookups).first().map(|account| account.id)
+}
+
+fn account_options(
+    lookups: &TransactionLookups,
+    transaction_type: JournalTransactionType,
+) -> Vec<&ChartAccount> {
+    lookups
+        .accounts
+        .iter()
+        .filter(|account| match transaction_type {
+            JournalTransactionType::Expense => account.account_type == "EXPENSE",
+            JournalTransactionType::Sales => {
+                account.account_type == "REVENUE" && !account.system_account
+            }
+            JournalTransactionType::Transfer => account.account_type == "ASSET",
+            _ => false,
+        })
+        .collect()
+}
+
+fn asset_accounts(lookups: &TransactionLookups) -> Vec<&ChartAccount> {
+    lookups
+        .accounts
+        .iter()
+        .filter(|account| account.account_type == "ASSET")
+        .collect()
+}
+
+fn bank_accounts(lookups: &TransactionLookups) -> Vec<&ChartAccount> {
+    lookups
+        .accounts
+        .iter()
+        .filter(|account| account.account_type == "BANK")
+        .collect()
+}
+
+fn cycle_employee(
+    lookups: &TransactionLookups,
+    current_id: Option<u16>,
+    step: isize,
+) -> Option<u16> {
+    let current = lookups
+        .employees
+        .iter()
+        .position(|employee| Some(employee.id) == current_id)
+        .unwrap_or_default();
+    lookups
+        .employees
+        .get(shifted_index(current, lookups.employees.len(), step))
+        .map(|employee| employee.id)
+}
+
+fn cycle_invoice(
+    lookups: &TransactionLookups,
+    current_id: Option<&str>,
+    step: isize,
+) -> Option<String> {
+    let current = lookups
+        .invoices
+        .iter()
+        .position(|invoice| Some(invoice.id_string().as_str()) == current_id)
+        .unwrap_or_default();
+    lookups
+        .invoices
+        .get(shifted_index(current, lookups.invoices.len(), step))
+        .map(Invoice::id_string)
+}
+
+fn cycle_payment_method(
+    lookups: &TransactionLookups,
+    current_id: Option<u16>,
+    step: isize,
+) -> Option<u16> {
+    let current = lookups
+        .payment_methods
+        .iter()
+        .position(|method| Some(method.id) == current_id)
+        .unwrap_or_default();
+    lookups
+        .payment_methods
+        .get(shifted_index(current, lookups.payment_methods.len(), step))
+        .map(|method| method.id)
+}
+
+fn cycle_account(
+    accounts: Vec<&ChartAccount>,
+    current_id: Option<u32>,
+    step: isize,
+) -> Option<u32> {
+    let current = accounts
+        .iter()
+        .position(|account| Some(account.id) == current_id)
+        .unwrap_or_default();
+    accounts
+        .get(shifted_index(current, accounts.len(), step))
+        .map(|account| account.id)
+}
+
+fn shifted_index(current: usize, len: usize, step: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    let len = len as isize;
+    (current as isize + step).rem_euclid(len) as usize
+}
+
+fn push_number(value: &mut f64, character: char) {
+    if !character.is_ascii_digit() && character != '.' {
+        return;
+    }
+
+    let mut text = decimal_value(*value);
+    if character == '.' && text.contains('.') {
+        return;
+    }
+    if text == "0" && character.is_ascii_digit() {
+        text.clear();
+    }
+    text.push(character);
+    if let Ok(parsed) = text.parse::<f64>() {
+        *value = parsed;
+    }
+}
+
+fn pop_number(value: &mut f64) {
+    let mut text = decimal_value(*value);
+    text.pop();
+    *value = text.parse::<f64>().unwrap_or_default();
+}
+
+fn decimal_value(value: f64) -> String {
+    if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        let value = format!("{value:.2}");
+        value
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
 }
 
 fn truncate(value: &str, max_width: usize) -> String {
@@ -906,6 +1649,7 @@ mod tests {
                 total: 0,
                 subtotal: 0,
             },
+            lookups: TransactionLookups::default(),
         }
     }
 }
