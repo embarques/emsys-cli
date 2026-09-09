@@ -37,6 +37,7 @@ enum ViewMode {
 
 #[derive(Debug, Clone, Copy)]
 struct LoadTarget {
+    statement_page: u64,
     selected_index: usize,
     journal_page: u64,
 }
@@ -73,6 +74,7 @@ impl App {
             load_generation: 0,
             load_started_at: None,
             active_target: LoadTarget {
+                statement_page: 1,
                 selected_index: 0,
                 journal_page: 1,
             },
@@ -124,6 +126,7 @@ impl App {
     fn current_target(&self) -> LoadTarget {
         match &self.state {
             ScreenState::Loaded(screen) => LoadTarget {
+                statement_page: screen.statement_page,
                 selected_index: screen.selected_index,
                 journal_page: screen.journals.page,
             },
@@ -136,6 +139,7 @@ impl App {
             && has_next_journal_page(&screen.journals)
         {
             self.load(LoadTarget {
+                statement_page: screen.statement_page,
                 selected_index: screen.selected_index,
                 journal_page: screen.journals.page.saturating_add(1),
             });
@@ -147,6 +151,7 @@ impl App {
             && screen.journals.page > 1
         {
             self.load(LoadTarget {
+                statement_page: screen.statement_page,
                 selected_index: screen.selected_index,
                 journal_page: screen.journals.page - 1,
             });
@@ -158,7 +163,14 @@ impl App {
             let next_index = screen.selected_index.saturating_add(1);
             if next_index < screen.statements.len() {
                 self.load(LoadTarget {
+                    statement_page: screen.statement_page,
                     selected_index: next_index,
+                    journal_page: 1,
+                });
+            } else if has_next_statement_page(screen) {
+                self.load(LoadTarget {
+                    statement_page: screen.statement_page.saturating_add(1),
+                    selected_index: 0,
                     journal_page: 1,
                 });
             }
@@ -170,7 +182,16 @@ impl App {
             && screen.selected_index > 0
         {
             self.load(LoadTarget {
+                statement_page: screen.statement_page,
                 selected_index: screen.selected_index - 1,
+                journal_page: 1,
+            });
+        } else if let ScreenState::Loaded(screen) = &self.state
+            && screen.statement_page > 1
+        {
+            self.load(LoadTarget {
+                statement_page: screen.statement_page - 1,
+                selected_index: usize::MAX,
                 journal_page: 1,
             });
         }
@@ -198,7 +219,11 @@ impl App {
             let api = EmsysApiClient::new(&config);
             let service = IncomeStatementService::new(api);
             let result = service
-                .screen(target.selected_index, target.journal_page)
+                .screen(
+                    target.statement_page,
+                    target.selected_index,
+                    target.journal_page,
+                )
                 .await;
             let _ = sender.send(LoadMessage {
                 generation,
@@ -376,8 +401,8 @@ fn metadata_lines(screen: &IncomeStatementScreen, view_mode: ViewMode) -> Vec<Li
             Span::raw(format!(
                 "#{} ({}/{})",
                 statement.id,
-                screen.selected_index + 1,
-                screen.statements.len()
+                statement_position(screen),
+                screen.statement_total.max(screen.statements.len() as u64)
             )),
             Span::raw("   "),
             Span::styled("Date: ", Style::default().fg(Color::Gray)),
@@ -586,6 +611,22 @@ fn has_next_journal_page(journals: &JournalPage) -> bool {
     journals.page.saturating_mul(per_page) < journals.total
 }
 
+fn has_next_statement_page(screen: &IncomeStatementScreen) -> bool {
+    let per_page = screen
+        .statement_results_per_page
+        .max(screen.statements.len() as u64)
+        .max(1);
+    screen.statement_page.saturating_mul(per_page) < screen.statement_total
+}
+
+fn statement_position(screen: &IncomeStatementScreen) -> u64 {
+    let per_page = screen
+        .statement_results_per_page
+        .max(screen.statements.len() as u64)
+        .max(1);
+    (screen.statement_page.saturating_sub(1) * per_page) + screen.selected_index as u64 + 1
+}
+
 fn scroll_offset(offset: u16, line_count: usize, area_height: u16) -> u16 {
     let visible_lines = area_height.saturating_sub(2) as usize;
     let max_offset = line_count.saturating_sub(visible_lines) as u16;
@@ -614,9 +655,9 @@ fn key_menu_lines(
 ) -> Vec<Line<'static>> {
     let page_label = match state {
         ScreenState::Loaded(screen) => format!(
-            "Stmt {}/{}  JPage {}",
-            screen.selected_index + 1,
-            screen.statements.len(),
+            "S {}/{} J {}",
+            statement_position(screen),
+            screen.statement_total.max(screen.statements.len() as u64),
             screen.journals.page
         ),
         _ => "Loading".to_string(),
@@ -638,12 +679,9 @@ fn key_menu_lines(
             Span::raw(" Refresh"),
         ]),
         Line::from(vec![
-            Span::styled("Up/k Down/j", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("Up/Down", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Scroll   "),
-            Span::styled(
-                "PgUp/PgDn Home/End",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("PgUp/PgDn", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Move   "),
             Span::styled("q/Esc", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Quit   "),
@@ -775,6 +813,22 @@ mod tests {
     }
 
     #[test]
+    fn detects_next_statement_page() {
+        let screen = screen_with_statement_page(1, 19, 20, 41);
+
+        assert!(has_next_statement_page(&screen));
+        assert_eq!(statement_position(&screen), 20);
+    }
+
+    #[test]
+    fn detects_last_statement_page() {
+        let screen = screen_with_statement_page(3, 0, 20, 41);
+
+        assert!(!has_next_statement_page(&screen));
+        assert_eq!(statement_position(&screen), 41);
+    }
+
+    #[test]
     fn clamps_scroll_offset_to_visible_content() {
         assert_eq!(scroll_offset(50, 20, 10), 12);
         assert_eq!(scroll_offset(5, 4, 10), 0);
@@ -799,5 +853,59 @@ mod tests {
         line.spans
             .iter()
             .any(|span| span.content.as_ref().contains(expected))
+    }
+
+    fn screen_with_statement_page(
+        statement_page: u64,
+        selected_index: usize,
+        results_per_page: u64,
+        total: u64,
+    ) -> IncomeStatementScreen {
+        IncomeStatementScreen {
+            statements: vec![crate::infrastructure::income_statement::IncomeStatement {
+                id: 1,
+                date: "2026-09-08T00:00:00Z".into(),
+                branch: None,
+                container: None,
+                delivery: None,
+                rate: 1.0,
+                currency: "USD".into(),
+                status: "closed".into(),
+                summary_total: None,
+                created_at: None,
+                updated_at: None,
+            }],
+            statement_page,
+            statement_results_per_page: results_per_page,
+            statement_total: total,
+            selected_index,
+            detail: crate::application::income_statement::IncomeStatementDetail {
+                statement: crate::infrastructure::income_statement::IncomeStatement {
+                    id: 1,
+                    date: "2026-09-08T00:00:00Z".into(),
+                    branch: None,
+                    container: None,
+                    delivery: None,
+                    rate: 1.0,
+                    currency: "USD".into(),
+                    status: "closed".into(),
+                    summary_total: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                summary: IncomeStatementSummary {
+                    currency: "USD".into(),
+                    rate: 1.0,
+                    totals: Vec::new(),
+                },
+            },
+            journals: JournalPage {
+                entries: Vec::new(),
+                page: 1,
+                results_per_page: 10,
+                total: 0,
+                subtotal: 0,
+            },
+        }
     }
 }

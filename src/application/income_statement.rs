@@ -20,6 +20,9 @@ pub struct IncomeStatementDetail {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IncomeStatementScreen {
     pub statements: Vec<IncomeStatement>,
+    pub statement_page: u64,
+    pub statement_results_per_page: u64,
+    pub statement_total: u64,
     pub selected_index: usize,
     pub detail: IncomeStatementDetail,
     pub journals: JournalPage,
@@ -72,15 +75,18 @@ impl IncomeStatementService {
 
     pub async fn screen(
         &self,
+        statement_page: u64,
         selected_index: usize,
         journal_page: u64,
     ) -> anyhow::Result<IncomeStatementScreen> {
+        let statement_page = statement_page.max(1);
+        let statement_offset = (statement_page - 1) * DEFAULT_STATEMENT_LIMIT;
         let response = self
             .api
             .search_income_statements(&QueryRequest {
                 pagination: Some(Pagination {
-                    page: Some(1),
-                    offset: Some(0),
+                    page: Some(statement_page),
+                    offset: Some(statement_offset),
                     limit: Some(DEFAULT_STATEMENT_LIMIT),
                 }),
                 sort: vec![Sort {
@@ -102,6 +108,9 @@ impl IncomeStatementService {
 
         Ok(IncomeStatementScreen {
             statements: response.data,
+            statement_page: response.page.max(1),
+            statement_results_per_page: response.results_per_page,
+            statement_total: response.total,
             selected_index,
             detail,
             journals,
