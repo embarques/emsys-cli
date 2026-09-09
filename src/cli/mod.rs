@@ -1,10 +1,12 @@
 use std::io::{self, Write};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use crate::{
-    application::income_statement::IncomeStatementService,
+    application::income_statement::{
+        IncomeStatementService, JournalTransactionType, JournalTransactionValues,
+    },
     context::AppContext,
     infrastructure::{
         api::EmsysApiClient,
@@ -40,7 +42,7 @@ pub enum Command {
     /// Income statement commands.
     Income {
         #[command(subcommand)]
-        command: IncomeCommand,
+        command: Box<IncomeCommand>,
     },
 }
 
@@ -66,6 +68,21 @@ pub enum IncomeCommand {
         /// Income statement numeric ID.
         id: u32,
     },
+
+    /// Reopen a closed income statement.
+    Open {
+        /// Income statement numeric ID.
+        id: u32,
+    },
+
+    /// Close an open income statement.
+    Close {
+        /// Income statement numeric ID.
+        id: u32,
+    },
+
+    /// Add a journal transaction to an income statement.
+    AddTransaction(IncomeAddTransactionArgs),
 }
 
 #[derive(Debug, Args)]
@@ -95,6 +112,97 @@ pub struct IncomeSearchArgs {
     sort: String,
 }
 
+#[derive(Debug, Args)]
+pub struct IncomeAddTransactionArgs {
+    /// Income statement numeric ID.
+    #[arg(long)]
+    statement_id: u32,
+
+    /// Transaction type, matching the daily income portal add form.
+    #[arg(long, value_enum)]
+    transaction_type: CliTransactionType,
+
+    /// Transaction amount.
+    #[arg(long, default_value_t = 0.0)]
+    amount: f64,
+
+    /// Employee numeric ID.
+    #[arg(long)]
+    employee_id: u16,
+
+    /// Account ID for expense, sales, or transfer destination.
+    #[arg(long)]
+    account_id: Option<u32>,
+
+    /// Source account ID for expense or transfer.
+    #[arg(long)]
+    source_account_id: Option<u32>,
+
+    /// Bank account ID for deposit or Zelle payment methods.
+    #[arg(long)]
+    payment_account_id: Option<u32>,
+
+    /// Existing invoice ID for payment, discount, or surcharge.
+    #[arg(long)]
+    invoice_id: Option<String>,
+
+    /// New invoice number for initial payment.
+    #[arg(long, default_value = "")]
+    invoice_number: String,
+
+    /// New invoice cost for initial payment.
+    #[arg(long, default_value_t = 0.0)]
+    invoice_cost: f64,
+
+    /// New invoice discount for initial payment.
+    #[arg(long, default_value_t = 0.0)]
+    invoice_discount: f64,
+
+    /// Payment method for payment-related transaction types.
+    #[arg(long, value_enum)]
+    payment_method: Option<CliPaymentMethod>,
+
+    /// Zelle transaction date, required when payment method is zelle.
+    #[arg(long, default_value = "")]
+    zelle_transaction_date: String,
+
+    /// Zelle transaction name, required when payment method is zelle.
+    #[arg(long, default_value = "")]
+    zelle_transaction_name: String,
+
+    /// Check number, required when payment method is check.
+    #[arg(long, default_value = "")]
+    check_number: String,
+
+    /// Reference number.
+    #[arg(long, default_value = "")]
+    ref_number: String,
+
+    /// Journal description.
+    #[arg(long, default_value = "")]
+    description: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliTransactionType {
+    InitialPayment,
+    Payment,
+    Expense,
+    Sales,
+    Discount,
+    Surcharge,
+    Transfer,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliPaymentMethod {
+    Cash,
+    Deposit,
+    Check,
+    Zelle,
+    CreditCard,
+}
+
 pub async fn run(context: &AppContext, command: Command) -> anyhow::Result<()> {
     match command {
         Command::Version => {
@@ -102,7 +210,7 @@ pub async fn run(context: &AppContext, command: Command) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Auth { command } => run_auth(context, command).await,
-        Command::Income { command } => run_income(context, command).await,
+        Command::Income { command } => run_income(context, *command).await,
     }
 }
 
@@ -118,6 +226,9 @@ async fn run_income(context: &AppContext, command: IncomeCommand) -> anyhow::Res
     match command {
         IncomeCommand::Search(args) => search_income_statements(context, args).await,
         IncomeCommand::Show { id } => show_income_statement(context, id).await,
+        IncomeCommand::Open { id } => set_income_statement_status(context, id, true).await,
+        IncomeCommand::Close { id } => set_income_statement_status(context, id, false).await,
+        IncomeCommand::AddTransaction(args) => add_income_transaction(context, args).await,
     }
 }
 
@@ -243,6 +354,89 @@ async fn show_income_statement(context: &AppContext, id: u32) -> anyhow::Result<
     Ok(())
 }
 
+async fn set_income_statement_status(
+    context: &AppContext,
+    id: u32,
+    open: bool,
+) -> anyhow::Result<()> {
+    let api = EmsysApiClient::new(&context.config);
+    let statement = IncomeStatementService::new(api)
+        .set_statement_open(id, open)
+        .await?;
+    let action = if open { "opened" } else { "closed" };
+
+    println!("Income statement #{} {action}", statement.id);
+    println!("Status: {}", statement.status);
+
+    Ok(())
+}
+
+async fn add_income_transaction(
+    context: &AppContext,
+    args: IncomeAddTransactionArgs,
+) -> anyhow::Result<()> {
+    let api = EmsysApiClient::new(&context.config);
+    let service = IncomeStatementService::new(api);
+    let statement = service.show(args.statement_id).await?.statement;
+    let lookups = service.transaction_lookups().await?;
+    let values = transaction_values(args);
+    let journal = service
+        .post_transaction(&statement, &lookups, &values)
+        .await?;
+
+    println!("Journal transaction created");
+    println!("Income statement: #{}", statement.id);
+    println!("Type: {}", journal.transaction_type);
+    println!("Amount: {:.2}", journal.transaction_amount);
+    println!("Reference: {}", empty_dash(&journal.ref_number));
+    println!("Description: {}", empty_dash(&journal.description));
+
+    Ok(())
+}
+
+fn transaction_values(args: IncomeAddTransactionArgs) -> JournalTransactionValues {
+    JournalTransactionValues {
+        transaction_type: transaction_type(args.transaction_type),
+        amount: args.amount,
+        ref_number: args.ref_number,
+        description: args.description,
+        employee_id: Some(args.employee_id),
+        account_id: args.account_id,
+        payment_account_id: args.payment_account_id,
+        source_account_id: args.source_account_id,
+        invoice_id: args.invoice_id,
+        invoice_number: args.invoice_number,
+        invoice_cost: args.invoice_cost,
+        invoice_discount: args.invoice_discount,
+        payment_method_id: args.payment_method.map(payment_method_id),
+        zelle_transaction_date: args.zelle_transaction_date,
+        zelle_transaction_name: args.zelle_transaction_name,
+        check_number: args.check_number,
+    }
+}
+
+fn transaction_type(value: CliTransactionType) -> JournalTransactionType {
+    match value {
+        CliTransactionType::InitialPayment => JournalTransactionType::InitialPayment,
+        CliTransactionType::Payment => JournalTransactionType::Payment,
+        CliTransactionType::Expense => JournalTransactionType::Expense,
+        CliTransactionType::Sales => JournalTransactionType::Sales,
+        CliTransactionType::Discount => JournalTransactionType::Discount,
+        CliTransactionType::Surcharge => JournalTransactionType::Surcharge,
+        CliTransactionType::Transfer => JournalTransactionType::Transfer,
+    }
+}
+
+fn payment_method_id(value: CliPaymentMethod) -> u16 {
+    match value {
+        CliPaymentMethod::Cash => 1,
+        CliPaymentMethod::Deposit => 2,
+        CliPaymentMethod::Check => 3,
+        CliPaymentMethod::Zelle => 4,
+        CliPaymentMethod::CreditCard => 5,
+    }
+}
+
 fn print_summary_total(line: &SummaryTotalLine, depth: usize) {
     let indent = "  ".repeat(depth);
     println!("{indent}{}: {:.2}", line.header, line.value);
@@ -277,6 +471,10 @@ fn print_company(company_id: &Option<String>) {
         Some(company_id) => println!("Company ID: {company_id}"),
         None => println!("Company ID: not available from Firebase profile"),
     }
+}
+
+fn empty_dash(value: &str) -> &str {
+    if value.trim().is_empty() { "-" } else { value }
 }
 
 fn logout(context: &AppContext) -> anyhow::Result<()> {
