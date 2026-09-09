@@ -12,11 +12,12 @@ use ratatui::{
 };
 
 use crate::{
-    application::income_statement::{IncomeStatementDetail, IncomeStatementService},
+    application::income_statement::{IncomeStatementScreen, IncomeStatementService, JournalPage},
     context::AppContext,
     infrastructure::{
         api::EmsysApiClient,
-        income_statement::{IncomeStatement, IncomeStatementSummary, SummaryTotalLine},
+        income_statement::{IncomeStatementSummary, SummaryTotalLine},
+        journal::Journal,
     },
     tui::{action::Action, event, terminal::TerminalSession},
 };
@@ -24,22 +25,37 @@ use crate::{
 #[derive(Debug)]
 enum ScreenState {
     Loading,
-    Loaded(Box<IncomeStatementDetail>),
+    Loaded(Box<IncomeStatementScreen>),
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Entries,
+    Totals,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoadTarget {
+    selected_index: usize,
+    journal_page: u64,
 }
 
 #[derive(Debug)]
 struct LoadMessage {
     generation: u64,
-    result: anyhow::Result<IncomeStatementDetail>,
+    target: LoadTarget,
+    result: anyhow::Result<IncomeStatementScreen>,
 }
 
 pub struct App {
     context: AppContext,
     should_quit: bool,
     state: ScreenState,
+    view_mode: ViewMode,
     load_generation: u64,
     load_started_at: Option<Instant>,
+    active_target: LoadTarget,
     scroll_offset: u16,
     loader_tx: mpsc::Sender<LoadMessage>,
     loader_rx: mpsc::Receiver<LoadMessage>,
@@ -53,8 +69,13 @@ impl App {
             context,
             should_quit: false,
             state: ScreenState::Loading,
+            view_mode: ViewMode::Entries,
             load_generation: 0,
             load_started_at: None,
+            active_target: LoadTarget {
+                selected_index: 0,
+                journal_page: 1,
+            },
             scroll_offset: 0,
             loader_tx,
             loader_rx,
@@ -63,7 +84,7 @@ impl App {
 
     pub fn run(mut self) -> anyhow::Result<()> {
         let mut terminal = TerminalSession::enter()?;
-        self.refresh();
+        self.load(self.active_target);
 
         while !self.should_quit {
             self.receive_loads();
@@ -80,7 +101,13 @@ impl App {
     fn handle_action(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
-            Action::Refresh => self.refresh(),
+            Action::Refresh => self.load(self.current_target()),
+            Action::JournalNextPage => self.next_journal_page(),
+            Action::JournalPreviousPage => self.previous_journal_page(),
+            Action::SelectNextStatement => self.select_next_statement(),
+            Action::SelectPreviousStatement => self.select_previous_statement(),
+            Action::ShowEntries => self.set_view_mode(ViewMode::Entries),
+            Action::ShowTotals => self.set_view_mode(ViewMode::Totals),
             Action::ScrollDown => self.scroll_offset = self.scroll_offset.saturating_add(1),
             Action::ScrollEnd => self.scroll_offset = u16::MAX,
             Action::ScrollPageDown => {
@@ -94,9 +121,72 @@ impl App {
         }
     }
 
-    fn refresh(&mut self) {
+    fn current_target(&self) -> LoadTarget {
+        match &self.state {
+            ScreenState::Loaded(screen) => LoadTarget {
+                selected_index: screen.selected_index,
+                journal_page: screen.journals.page,
+            },
+            _ => self.active_target,
+        }
+    }
+
+    fn next_journal_page(&mut self) {
+        if let ScreenState::Loaded(screen) = &self.state
+            && has_next_journal_page(&screen.journals)
+        {
+            self.load(LoadTarget {
+                selected_index: screen.selected_index,
+                journal_page: screen.journals.page.saturating_add(1),
+            });
+        }
+    }
+
+    fn previous_journal_page(&mut self) {
+        if let ScreenState::Loaded(screen) = &self.state
+            && screen.journals.page > 1
+        {
+            self.load(LoadTarget {
+                selected_index: screen.selected_index,
+                journal_page: screen.journals.page - 1,
+            });
+        }
+    }
+
+    fn select_next_statement(&mut self) {
+        if let ScreenState::Loaded(screen) = &self.state {
+            let next_index = screen.selected_index.saturating_add(1);
+            if next_index < screen.statements.len() {
+                self.load(LoadTarget {
+                    selected_index: next_index,
+                    journal_page: 1,
+                });
+            }
+        }
+    }
+
+    fn select_previous_statement(&mut self) {
+        if let ScreenState::Loaded(screen) = &self.state
+            && screen.selected_index > 0
+        {
+            self.load(LoadTarget {
+                selected_index: screen.selected_index - 1,
+                journal_page: 1,
+            });
+        }
+    }
+
+    fn set_view_mode(&mut self, view_mode: ViewMode) {
+        if self.view_mode != view_mode {
+            self.view_mode = view_mode;
+            self.scroll_offset = 0;
+        }
+    }
+
+    fn load(&mut self, target: LoadTarget) {
         self.load_generation += 1;
         self.load_started_at = Some(Instant::now());
+        self.active_target = target;
         self.state = ScreenState::Loading;
         self.scroll_offset = 0;
 
@@ -107,8 +197,14 @@ impl App {
         tokio::spawn(async move {
             let api = EmsysApiClient::new(&config);
             let service = IncomeStatementService::new(api);
-            let result = service.latest().await;
-            let _ = sender.send(LoadMessage { generation, result });
+            let result = service
+                .screen(target.selected_index, target.journal_page)
+                .await;
+            let _ = sender.send(LoadMessage {
+                generation,
+                target,
+                result,
+            });
         });
     }
 
@@ -118,8 +214,9 @@ impl App {
                 continue;
             }
 
+            self.active_target = message.target;
             self.state = match message.result {
-                Ok(detail) => ScreenState::Loaded(Box::new(detail)),
+                Ok(screen) => ScreenState::Loaded(Box::new(screen)),
                 Err(error) => ScreenState::Error(safe_error_message(error)),
             };
             self.load_started_at = None;
@@ -147,40 +244,8 @@ impl App {
         frame.render_widget(Clear, chunks[0]);
         frame.render_widget(header, chunks[0]);
 
-        let summary_width = chunks[2].width.saturating_sub(2).max(20) as usize;
-        let scroll_offset = match &self.state {
-            ScreenState::Loaded(detail) => scroll_offset(
-                self.scroll_offset,
-                summary_lines(&detail.summary, summary_width).len(),
-                chunks[2].height,
-            ),
-            _ => 0,
-        };
-
         match &self.state {
-            ScreenState::Loaded(detail) => {
-                let metadata = Paragraph::new(metadata_lines(&detail.statement, &detail.summary))
-                    .block(
-                        Block::default()
-                            .title(" Statement ")
-                            .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM),
-                    );
-                frame.render_widget(Clear, chunks[1]);
-                frame.render_widget(metadata, chunks[1]);
-
-                let summary_lines = visible_lines(
-                    summary_lines(&detail.summary, summary_width),
-                    scroll_offset,
-                    chunks[2].height,
-                );
-                let summary = Paragraph::new(summary_lines).block(
-                    Block::default()
-                        .title(" Summary Totals ")
-                        .borders(Borders::LEFT | Borders::RIGHT),
-                );
-                frame.render_widget(Clear, chunks[2]);
-                frame.render_widget(summary, chunks[2]);
-            }
+            ScreenState::Loaded(screen) => self.render_loaded(frame, chunks.as_ref(), screen),
             _ => {
                 let body = Paragraph::new(status_lines(&self.state, self.load_started_at))
                     .block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
@@ -190,10 +255,49 @@ impl App {
             }
         }
 
-        let footer = Paragraph::new(key_menu_lines(scroll_offset))
-            .block(Block::default().title(" Keys ").borders(Borders::ALL));
+        let footer = Paragraph::new(key_menu_lines(
+            &self.state,
+            self.view_mode,
+            self.scroll_offset,
+        ))
+        .block(Block::default().title(" Keys ").borders(Borders::ALL));
         frame.render_widget(Clear, chunks[3]);
         frame.render_widget(footer, chunks[3]);
+    }
+
+    fn render_loaded(
+        &self,
+        frame: &mut Frame<'_>,
+        chunks: &[Rect],
+        screen: &IncomeStatementScreen,
+    ) {
+        let metadata = Paragraph::new(metadata_lines(screen, self.view_mode)).block(
+            Block::default()
+                .title(" Statement ")
+                .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM),
+        );
+        frame.render_widget(Clear, chunks[1]);
+        frame.render_widget(metadata, chunks[1]);
+
+        let body_width = chunks[2].width.saturating_sub(2).max(20) as usize;
+        let body_lines = match self.view_mode {
+            ViewMode::Entries => journal_lines(screen, body_width),
+            ViewMode::Totals => summary_lines(&screen.detail.summary, body_width),
+        };
+        let scroll_offset = scroll_offset(self.scroll_offset, body_lines.len(), chunks[2].height);
+        let title = match self.view_mode {
+            ViewMode::Entries => " Journal Entries ",
+            ViewMode::Totals => " Income Totals ",
+        };
+
+        let body = Paragraph::new(visible_lines(body_lines, scroll_offset, chunks[2].height))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::LEFT | Borders::RIGHT),
+            );
+        frame.render_widget(Clear, chunks[2]);
+        frame.render_widget(body, chunks[2]);
     }
 }
 
@@ -227,7 +331,7 @@ fn status_lines(state: &ScreenState, load_started_at: Option<Instant>) -> Vec<Li
                 .unwrap_or_default();
             vec![
                 Line::from(""),
-                Line::from("Loading latest income statement..."),
+                Line::from("Loading income statement journal entries..."),
                 Line::from(format!("Elapsed: {elapsed}s")),
             ]
         }
@@ -245,10 +349,9 @@ fn status_lines(state: &ScreenState, load_started_at: Option<Instant>) -> Vec<Li
     }
 }
 
-fn metadata_lines(
-    statement: &IncomeStatement,
-    summary: &IncomeStatementSummary,
-) -> Vec<Line<'static>> {
+fn metadata_lines(screen: &IncomeStatementScreen, view_mode: ViewMode) -> Vec<Line<'static>> {
+    let statement = &screen.detail.statement;
+    let summary = &screen.detail.summary;
     let branch = statement
         .branch
         .as_ref()
@@ -262,14 +365,26 @@ fn metadata_lines(
     } else {
         "-"
     };
+    let mode = match view_mode {
+        ViewMode::Entries => "Entries",
+        ViewMode::Totals => "Totals",
+    };
 
     vec![
         Line::from(vec![
             Span::styled("Statement: ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("#{}", statement.id)),
+            Span::raw(format!(
+                "#{} ({}/{})",
+                statement.id,
+                screen.selected_index + 1,
+                screen.statements.len()
+            )),
             Span::raw("   "),
             Span::styled("Date: ", Style::default().fg(Color::Gray)),
             Span::raw(statement.date.clone()),
+            Span::raw("   "),
+            Span::styled("View: ", Style::default().fg(Color::Gray)),
+            Span::raw(mode),
         ]),
         Line::from(vec![
             Span::styled("Status: ", Style::default().fg(Color::Gray)),
@@ -282,6 +397,93 @@ fn metadata_lines(
             Span::raw(currency.to_string()),
         ]),
     ]
+}
+
+fn journal_lines(screen: &IncomeStatementScreen, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let journals = &screen.journals;
+
+    if journals.entries.is_empty() {
+        lines.push(Line::from(
+            "No journal entries returned for this income statement.",
+        ));
+        return lines;
+    }
+
+    for (index, journal) in journals.entries.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(""));
+        }
+        push_journal_lines(&mut lines, journal, width);
+    }
+
+    lines
+}
+
+fn push_journal_lines(lines: &mut Vec<Line<'static>>, journal: &Journal, width: usize) {
+    let date = journal
+        .date
+        .as_deref()
+        .map(short_date)
+        .unwrap_or_else(|| "-".to_string());
+    let reference = if journal.ref_number.is_empty() {
+        "-".to_string()
+    } else {
+        journal.ref_number.clone()
+    };
+    let transaction_type = if journal.transaction_type.is_empty() {
+        "-".to_string()
+    } else {
+        journal.transaction_type.clone()
+    };
+    let amount = format_money(journal.transaction_amount);
+    let label = format!(
+        "{}  {}  {}  {}",
+        date,
+        reference,
+        transaction_type,
+        truncate(&journal.description, width.saturating_sub(30).max(12))
+    );
+    let label = truncate(&label, width.saturating_sub(amount.len() + 2).max(12));
+    let spaces = width.saturating_sub(label.len() + amount.len());
+
+    lines.push(Line::from(vec![
+        Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(spaces)),
+        Span::styled(amount, Style::default().add_modifier(Modifier::BOLD)),
+    ]));
+
+    for account in &journal.accounts {
+        let account_name = if account.name.is_empty() {
+            format!("Account #{}", account.id)
+        } else {
+            account.name.clone()
+        };
+        let debit = if account.debit.abs() > f64::EPSILON {
+            format_money(account.debit)
+        } else {
+            "-".to_string()
+        };
+        let credit = if account.credit.abs() > f64::EPSILON {
+            format_money(account.credit)
+        } else {
+            "-".to_string()
+        };
+        let prefix = format!(
+            "  {}",
+            truncate(&account_name, width.saturating_sub(24).max(12))
+        );
+        let spacer = width.saturating_sub(prefix.len() + debit.len() + credit.len() + 8);
+        lines.push(Line::from(vec![
+            Span::raw(prefix),
+            Span::raw(" ".repeat(spacer)),
+            Span::styled("Dr ", Style::default().fg(Color::Gray)),
+            Span::raw(debit),
+            Span::raw("  "),
+            Span::styled("Cr ", Style::default().fg(Color::Gray)),
+            Span::raw(credit),
+        ]));
+    }
 }
 
 fn summary_lines(summary: &IncomeStatementSummary, width: usize) -> Vec<Line<'static>> {
@@ -372,6 +574,18 @@ fn format_money(value: f64) -> String {
     format!("${value:.2}")
 }
 
+fn short_date(value: &str) -> String {
+    value.split('T').next().unwrap_or(value).to_string()
+}
+
+fn has_next_journal_page(journals: &JournalPage) -> bool {
+    let per_page = journals
+        .results_per_page
+        .max(journals.entries.len() as u64)
+        .max(1);
+    journals.page.saturating_mul(per_page) < journals.total
+}
+
 fn scroll_offset(offset: u16, line_count: usize, area_height: u16) -> u16 {
     let visible_lines = area_height.saturating_sub(2) as usize;
     let max_offset = line_count.saturating_sub(visible_lines) as u16;
@@ -393,25 +607,48 @@ fn visible_lines(lines: Vec<Line<'static>>, offset: u16, area_height: u16) -> Ve
     visible
 }
 
-fn key_menu_lines(scroll_offset: u16) -> Vec<Line<'static>> {
+fn key_menu_lines(
+    state: &ScreenState,
+    view_mode: ViewMode,
+    scroll_offset: u16,
+) -> Vec<Line<'static>> {
+    let page_label = match state {
+        ScreenState::Loaded(screen) => format!(
+            "Stmt {}/{}  JPage {}",
+            screen.selected_index + 1,
+            screen.statements.len(),
+            screen.journals.page
+        ),
+        _ => "Loading".to_string(),
+    };
+    let toggle = match view_mode {
+        ViewMode::Entries => ("t", "Totals"),
+        ViewMode::Totals => ("e", "Entries"),
+    };
+
     vec![
         Line::from(vec![
-            Span::styled("Up/k", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Scroll up   "),
-            Span::styled("Down/j", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Scroll down   "),
-            Span::styled("PgUp/PgDn", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Page"),
+            Span::styled("Left/Right", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Statement   "),
+            Span::styled("p/n", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Journal page   "),
+            Span::styled(toggle.0, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" {}   ", toggle.1)),
+            Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Refresh"),
         ]),
         Line::from(vec![
-            Span::styled("Home/End", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Top/bottom   "),
-            Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" Refresh   "),
+            Span::styled("Up/k Down/j", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Scroll   "),
+            Span::styled(
+                "PgUp/PgDn Home/End",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Move   "),
             Span::styled("q/Esc", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" Quit   "),
             Span::styled(
-                format!("Line {}", scroll_offset.saturating_add(1)),
+                format!("{page_label}  Line {}", scroll_offset.saturating_add(1)),
                 Style::default().fg(Color::Gray),
             ),
         ]),
@@ -471,12 +708,6 @@ mod tests {
         assert!(line_contains(&lines[1], "Efectivo"));
     }
 
-    fn line_contains(line: &Line<'_>, expected: &str) -> bool {
-        line.spans
-            .iter()
-            .any(|span| span.content.as_ref() == expected)
-    }
-
     #[test]
     fn summary_line_right_aligns_money() {
         let line = summary_line("Total Ingresos", 12800.0, 0, 32, Style::default());
@@ -488,6 +719,59 @@ mod tests {
 
         assert_eq!(rendered.len(), 32);
         assert!(rendered.ends_with("$12800.00"));
+    }
+
+    #[test]
+    fn journal_lines_include_entry_and_account_amounts() {
+        let mut lines = Vec::new();
+        push_journal_lines(
+            &mut lines,
+            &Journal {
+                id: serde_json::json!("66f000000000000000000001"),
+                description: "Invoice payment".into(),
+                date: Some("2026-09-08T00:00:00Z".into()),
+                ref_number: "A-100".into(),
+                payment_method: None,
+                currency: "USD".into(),
+                rate: 1.0,
+                transaction_type: "PAYMENT".into(),
+                invoice: None,
+                income_statement: None,
+                customer: None,
+                employee: None,
+                accounts: vec![crate::infrastructure::journal::JournalAccount {
+                    id: serde_json::json!(1),
+                    name: "Cash on Hand".into(),
+                    account_type: "ASSET".into(),
+                    debit: 120.0,
+                    credit: 0.0,
+                }],
+                transaction_amount: 120.0,
+                transaction_balance: 0.0,
+            },
+            80,
+        );
+
+        assert!(line_contains(&lines[0], "$120.00"));
+        assert!(line_contains(&lines[1], "Cash on Hand"));
+    }
+
+    #[test]
+    fn detects_next_journal_page() {
+        assert!(has_next_journal_page(&JournalPage {
+            entries: Vec::new(),
+            page: 1,
+            results_per_page: 10,
+            total: 25,
+            subtotal: 10,
+        }));
+        assert!(!has_next_journal_page(&JournalPage {
+            entries: Vec::new(),
+            page: 3,
+            results_per_page: 10,
+            total: 25,
+            subtotal: 5,
+        }));
     }
 
     #[test]
@@ -509,5 +793,11 @@ mod tests {
         assert_eq!(visible.len(), 2);
         assert!(line_contains(&visible[0], "two"));
         assert!(line_contains(&visible[1], "three"));
+    }
+
+    fn line_contains(line: &Line<'_>, expected: &str) -> bool {
+        line.spans
+            .iter()
+            .any(|span| span.content.as_ref().contains(expected))
     }
 }

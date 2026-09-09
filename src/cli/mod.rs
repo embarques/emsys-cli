@@ -9,7 +9,8 @@ use crate::{
     infrastructure::{
         api::EmsysApiClient,
         auth::FirebaseAuthClient,
-        income_statement::{IncomeStatementSearchRequest, Pagination, Sort, SummaryTotalLine},
+        income_statement::{IncomeStatementSearchRequest, SummaryTotalLine},
+        query::{Pagination, Sort},
         session::SessionManager,
     },
 };

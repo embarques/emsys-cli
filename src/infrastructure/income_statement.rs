@@ -1,58 +1,15 @@
 use reqwest::Method;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Deserialize;
 use thiserror::Error;
 
-use crate::infrastructure::api::{ApiError, EmsysApiClient};
+use crate::infrastructure::{
+    api::{ApiError, EmsysApiClient},
+    query::QueryRequest,
+};
 
 const INCOME_STATEMENT_SEARCH_PATH: &str = "/income-statements/search";
 
-#[derive(Debug, Clone, Serialize, Default, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct IncomeStatementSearchRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub field: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operator: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub filters: Vec<QueryFilter>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pagination: Option<Pagination>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sort: Vec<Sort>,
-}
-
-#[derive(Debug, Clone, Serialize, Default, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct QueryFilter {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub field: Option<String>,
-    pub operator: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub filters: Vec<QueryFilter>,
-}
-
-#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Pagination {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Sort {
-    pub field: String,
-    pub direction: String,
-}
+pub type IncomeStatementSearchRequest = QueryRequest;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -145,6 +102,7 @@ pub struct IncomeStatement {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Branch {
+    #[serde(default)]
     pub id: u16,
     #[serde(default)]
     pub name: String,
@@ -155,6 +113,7 @@ pub struct Branch {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Container {
+    #[serde(default)]
     pub id: u32,
     #[serde(default)]
     pub name: String,
@@ -165,6 +124,7 @@ pub struct Container {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Delivery {
+    #[serde(default)]
     pub id: u32,
     #[serde(default)]
     pub name: String,
@@ -307,6 +267,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infrastructure::query::{Pagination, QueryFilter, Sort};
+    use serde_json::Value;
 
     #[test]
     fn serializes_search_request_using_api_contract() {
