@@ -5,10 +5,10 @@ use std::{
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crate::{
@@ -40,6 +40,7 @@ pub struct App {
     state: ScreenState,
     load_generation: u64,
     load_started_at: Option<Instant>,
+    scroll_offset: u16,
     loader_tx: mpsc::Sender<LoadMessage>,
     loader_rx: mpsc::Receiver<LoadMessage>,
 }
@@ -54,6 +55,7 @@ impl App {
             state: ScreenState::Loading,
             load_generation: 0,
             load_started_at: None,
+            scroll_offset: 0,
             loader_tx,
             loader_rx,
         }
@@ -79,6 +81,16 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::Refresh => self.refresh(),
+            Action::ScrollDown => self.scroll_offset = self.scroll_offset.saturating_add(1),
+            Action::ScrollEnd => self.scroll_offset = u16::MAX,
+            Action::ScrollPageDown => {
+                self.scroll_offset = self.scroll_offset.saturating_add(PAGE_SCROLL)
+            }
+            Action::ScrollPageUp => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(PAGE_SCROLL)
+            }
+            Action::ScrollStart => self.scroll_offset = 0,
+            Action::ScrollUp => self.scroll_offset = self.scroll_offset.saturating_sub(1),
         }
     }
 
@@ -86,6 +98,7 @@ impl App {
         self.load_generation += 1;
         self.load_started_at = Some(Instant::now());
         self.state = ScreenState::Loading;
+        self.scroll_offset = 0;
 
         let generation = self.load_generation;
         let sender = self.loader_tx.clone();
@@ -110,6 +123,7 @@ impl App {
                 Err(error) => ScreenState::Error(safe_error_message(error)),
             };
             self.load_started_at = None;
+            self.scroll_offset = 0;
         }
     }
 
@@ -119,8 +133,9 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
-                Constraint::Min(6),
-                Constraint::Length(3),
+                Constraint::Length(5),
+                Constraint::Min(4),
+                Constraint::Length(4),
             ])
             .split(area);
 
@@ -129,18 +144,60 @@ impl App {
                 .title(" EMSYS - Income Statement ")
                 .borders(Borders::ALL),
         );
+        frame.render_widget(Clear, chunks[0]);
         frame.render_widget(header, chunks[0]);
 
-        let body = Paragraph::new(body_lines(&self.state, self.load_started_at))
-            .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
-            .wrap(ratatui::widgets::Wrap { trim: false });
-        frame.render_widget(body, chunks[1]);
+        let summary_width = chunks[2].width.saturating_sub(2).max(20) as usize;
+        let scroll_offset = match &self.state {
+            ScreenState::Loaded(detail) => scroll_offset(
+                self.scroll_offset,
+                summary_lines(&detail.summary, summary_width).len(),
+                chunks[2].height,
+            ),
+            _ => 0,
+        };
 
-        let footer = Paragraph::new(vec![Line::from("r Refresh"), Line::from("q/Esc Quit")])
-            .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(footer, chunks[2]);
+        match &self.state {
+            ScreenState::Loaded(detail) => {
+                let metadata = Paragraph::new(metadata_lines(&detail.statement, &detail.summary))
+                    .block(
+                        Block::default()
+                            .title(" Statement ")
+                            .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM),
+                    );
+                frame.render_widget(Clear, chunks[1]);
+                frame.render_widget(metadata, chunks[1]);
+
+                let summary_lines = visible_lines(
+                    summary_lines(&detail.summary, summary_width),
+                    scroll_offset,
+                    chunks[2].height,
+                );
+                let summary = Paragraph::new(summary_lines).block(
+                    Block::default()
+                        .title(" Summary Totals ")
+                        .borders(Borders::LEFT | Borders::RIGHT),
+                );
+                frame.render_widget(Clear, chunks[2]);
+                frame.render_widget(summary, chunks[2]);
+            }
+            _ => {
+                let body = Paragraph::new(status_lines(&self.state, self.load_started_at))
+                    .block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
+                let area = merged_area(chunks[1], chunks[2]);
+                frame.render_widget(Clear, area);
+                frame.render_widget(body, area);
+            }
+        }
+
+        let footer = Paragraph::new(key_menu_lines(scroll_offset))
+            .block(Block::default().title(" Keys ").borders(Borders::ALL));
+        frame.render_widget(Clear, chunks[3]);
+        frame.render_widget(footer, chunks[3]);
     }
 }
+
+const PAGE_SCROLL: u16 = 8;
 
 pub fn run(context: AppContext) -> anyhow::Result<()> {
     App::new(context).run()
@@ -162,7 +219,7 @@ fn header_lines(context: &AppContext, state: &ScreenState) -> Vec<Line<'static>>
     ])]
 }
 
-fn body_lines(state: &ScreenState, load_started_at: Option<Instant>) -> Vec<Line<'static>> {
+fn status_lines(state: &ScreenState, load_started_at: Option<Instant>) -> Vec<Line<'static>> {
     match state {
         ScreenState::Loading => {
             let elapsed = load_started_at
@@ -174,7 +231,7 @@ fn body_lines(state: &ScreenState, load_started_at: Option<Instant>) -> Vec<Line
                 Line::from(format!("Elapsed: {elapsed}s")),
             ]
         }
-        ScreenState::Loaded(detail) => loaded_lines(&detail.statement, &detail.summary),
+        ScreenState::Loaded(_) => Vec::new(),
         ScreenState::Error(message) => vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -188,7 +245,7 @@ fn body_lines(state: &ScreenState, load_started_at: Option<Instant>) -> Vec<Line
     }
 }
 
-fn loaded_lines(
+fn metadata_lines(
     statement: &IncomeStatement,
     summary: &IncomeStatementSummary,
 ) -> Vec<Line<'static>> {
@@ -198,13 +255,15 @@ fn loaded_lines(
         .map(|branch| branch.name.as_str())
         .filter(|name| !name.is_empty())
         .unwrap_or("-");
-    let currency = if summary.currency.is_empty() {
+    let currency = if !summary.currency.is_empty() {
+        summary.currency.as_str()
+    } else if !statement.currency.is_empty() {
         statement.currency.as_str()
     } else {
-        summary.currency.as_str()
+        "-"
     };
 
-    let mut lines = vec![
+    vec![
         Line::from(vec![
             Span::styled("Statement: ", Style::default().fg(Color::Gray)),
             Span::raw(format!("#{}", statement.id)),
@@ -222,42 +281,70 @@ fn loaded_lines(
             Span::styled("Currency: ", Style::default().fg(Color::Gray)),
             Span::raw(currency.to_string()),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Summary Totals",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-    ];
+    ]
+}
+
+fn summary_lines(summary: &IncomeStatementSummary, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
 
     if summary.totals.is_empty() {
         lines.push(Line::from("No summary totals returned by the API."));
     } else {
         for line in &summary.totals {
-            push_summary_line(&mut lines, line, 0);
+            push_summary_line(&mut lines, line, 0, width);
         }
     }
 
     lines
 }
 
-fn push_summary_line(lines: &mut Vec<Line<'static>>, line: &SummaryTotalLine, depth: usize) {
-    let indent = "  ".repeat(depth);
+fn merged_area(top: Rect, bottom: Rect) -> Rect {
+    Rect {
+        x: top.x,
+        y: top.y,
+        width: top.width,
+        height: top.height.saturating_add(bottom.height),
+    }
+}
+
+fn push_summary_line(
+    lines: &mut Vec<Line<'static>>,
+    line: &SummaryTotalLine,
+    depth: usize,
+    width: usize,
+) {
     let style = if depth == 0 {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
 
-    lines.push(Line::from(vec![
-        Span::raw(indent),
-        Span::styled(line.header.clone(), style),
-        Span::raw("  "),
-        Span::styled(format_money(line.value), style),
-    ]));
+    lines.push(summary_line(&line.header, line.value, depth, width, style));
 
     for detail in &line.details {
-        push_summary_line(lines, detail, depth + 1);
+        push_summary_line(lines, detail, depth + 1, width);
     }
+}
+
+fn summary_line(
+    label: &str,
+    value: f64,
+    depth: usize,
+    width: usize,
+    style: Style,
+) -> Line<'static> {
+    let money = format_money(value);
+    let indent_width = depth * 2;
+    let label_width = width.saturating_sub(indent_width + money.len() + 2).max(12);
+    let display_label = truncate(label, label_width);
+    let spaces = width.saturating_sub(indent_width + display_label.len() + money.len());
+
+    Line::from(vec![
+        Span::raw(" ".repeat(indent_width)),
+        Span::styled(display_label, style),
+        Span::raw(" ".repeat(spaces)),
+        Span::styled(money, style),
+    ])
 }
 
 fn environment_label(api_url: &str) -> String {
@@ -283,6 +370,66 @@ fn status_label(status: &str) -> String {
 
 fn format_money(value: f64) -> String {
     format!("${value:.2}")
+}
+
+fn scroll_offset(offset: u16, line_count: usize, area_height: u16) -> u16 {
+    let visible_lines = area_height.saturating_sub(2) as usize;
+    let max_offset = line_count.saturating_sub(visible_lines) as u16;
+    offset.min(max_offset)
+}
+
+fn visible_lines(lines: Vec<Line<'static>>, offset: u16, area_height: u16) -> Vec<Line<'static>> {
+    let visible_count = area_height.saturating_sub(2) as usize;
+    let mut visible: Vec<_> = lines
+        .into_iter()
+        .skip(offset as usize)
+        .take(visible_count)
+        .collect();
+
+    while visible.len() < visible_count {
+        visible.push(Line::from(""));
+    }
+
+    visible
+}
+
+fn key_menu_lines(scroll_offset: u16) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("Up/k", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Scroll up   "),
+            Span::styled("Down/j", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Scroll down   "),
+            Span::styled("PgUp/PgDn", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Page"),
+        ]),
+        Line::from(vec![
+            Span::styled("Home/End", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Top/bottom   "),
+            Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Refresh   "),
+            Span::styled("q/Esc", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Quit   "),
+            Span::styled(
+                format!("Line {}", scroll_offset.saturating_add(1)),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+    ]
+}
+
+fn truncate(value: &str, max_width: usize) -> String {
+    if value.len() <= max_width {
+        return value.to_string();
+    }
+
+    if max_width <= 1 {
+        return value.chars().take(max_width).collect();
+    }
+
+    let mut truncated: String = value.chars().take(max_width - 1).collect();
+    truncated.push('~');
+    truncated
 }
 
 fn safe_error_message(error: anyhow::Error) -> String {
@@ -316,6 +463,7 @@ mod tests {
                 }],
             },
             0,
+            40,
         );
 
         assert_eq!(lines.len(), 2);
@@ -327,5 +475,39 @@ mod tests {
         line.spans
             .iter()
             .any(|span| span.content.as_ref() == expected)
+    }
+
+    #[test]
+    fn summary_line_right_aligns_money() {
+        let line = summary_line("Total Ingresos", 12800.0, 0, 32, Style::default());
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(rendered.len(), 32);
+        assert!(rendered.ends_with("$12800.00"));
+    }
+
+    #[test]
+    fn clamps_scroll_offset_to_visible_content() {
+        assert_eq!(scroll_offset(50, 20, 10), 12);
+        assert_eq!(scroll_offset(5, 4, 10), 0);
+    }
+
+    #[test]
+    fn selects_visible_summary_window() {
+        let lines = vec![
+            Line::from("one"),
+            Line::from("two"),
+            Line::from("three"),
+            Line::from("four"),
+        ];
+        let visible = visible_lines(lines, 1, 4);
+
+        assert_eq!(visible.len(), 2);
+        assert!(line_contains(&visible[0], "two"));
+        assert!(line_contains(&visible[1], "three"));
     }
 }

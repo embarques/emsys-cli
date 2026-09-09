@@ -2,4 +2,10 @@
 pub enum Action {
     Quit,
     Refresh,
+    ScrollDown,
+    ScrollEnd,
+    ScrollPageDown,
+    ScrollPageUp,
+    ScrollStart,
+    ScrollUp,
 }
