@@ -1,15 +1,17 @@
+use std::path::Path;
+
 use thiserror::Error;
 
 use crate::infrastructure::{
     auth::{AuthError, AuthSession, FirebaseAuthClient},
     config::FirebaseConfig,
-    credentials::{CredentialError, CredentialStore},
+    session_store::{SessionFileStore, SessionStoreError},
 };
 
 #[derive(Debug, Clone)]
 pub struct SessionManager {
     auth: FirebaseAuthClient,
-    credentials: CredentialStore,
+    session_store: SessionFileStore,
 }
 
 #[derive(Debug, Error)]
@@ -21,37 +23,41 @@ pub enum SessionError {
     Auth(#[from] AuthError),
 
     #[error(transparent)]
-    Credentials(#[from] CredentialError),
+    SessionStore(#[from] SessionStoreError),
 }
 
 impl SessionManager {
     pub fn new(config: &FirebaseConfig) -> Self {
         Self {
             auth: FirebaseAuthClient::new(config),
-            credentials: CredentialStore::new(),
+            session_store: SessionFileStore::new(),
         }
     }
 
     pub fn save(&self, session: &AuthSession) -> Result<(), SessionError> {
-        self.credentials
+        self.session_store
             .save_refresh_token(&session.refresh_token)?;
         Ok(())
     }
 
     pub fn clear(&self) -> Result<bool, SessionError> {
-        Ok(self.credentials.clear_refresh_token()?)
+        Ok(self.session_store.clear_refresh_token()?)
+    }
+
+    pub fn session_file_path(&self) -> &Path {
+        self.session_store.path()
     }
 
     pub async fn refresh(&self) -> Result<AuthSession, SessionError> {
         let refresh_token = self
-            .credentials
+            .session_store
             .load_refresh_token()?
             .ok_or(SessionError::NotLoggedIn)?;
 
         let session = self.auth.refresh(&refresh_token).await?;
 
         if session.refresh_token != refresh_token {
-            self.credentials
+            self.session_store
                 .save_refresh_token(&session.refresh_token)?;
         }
 

@@ -3,6 +3,6 @@
 pub mod api;
 pub mod auth;
 pub mod config;
-pub mod credentials;
 pub mod income_statement;
 pub mod session;
+pub mod session_store;

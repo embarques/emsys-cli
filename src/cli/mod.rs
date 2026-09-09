@@ -45,7 +45,7 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
-    /// Sign in with Firebase and save the session securely.
+    /// Sign in with Firebase and save the session.
     Login,
 
     /// Verify the saved authentication session.
@@ -147,7 +147,7 @@ async fn login(context: &AppContext) -> anyhow::Result<()> {
     println!("Firebase UID: {}", session.user_id);
     print_company(&session.company_id);
     println!("EMSYS API verification: OK");
-    println!("Session saved securely");
+    println!("Session file: {}", sessions.session_file_path().display());
 
     Ok(())
 }
@@ -160,6 +160,12 @@ async fn auth_status(context: &AppContext) -> anyhow::Result<()> {
     println!("Firebase UID: {}", session.user_id);
     print_company(&session.company_id);
     println!("EMSYS API verification: OK");
+    println!(
+        "Session file: {}",
+        SessionManager::new(&context.config.firebase)
+            .session_file_path()
+            .display()
+    );
 
     Ok(())
 }

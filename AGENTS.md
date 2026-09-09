@@ -41,7 +41,7 @@ emsys-cli/
 │   ├── application/       # application-level orchestration/services
 │   ├── cli/               # Clap commands and CLI presentation
 │   ├── domain/            # domain types and domain rules
-│   ├── infrastructure/    # EMSYS HTTP, Firebase, config, credentials
+│   ├── infrastructure/    # EMSYS HTTP, Firebase, config, session
 │   ├── tui/               # Ratatui presentation and terminal event handling
 │   ├── bootstrap.rs       # application startup wiring
 │   ├── context.rs         # shared application context
@@ -68,7 +68,7 @@ Do not create alternative top-level architectures such as `services/`, `clients/
 | TUI | `src/tui/` | Ratatui rendering, terminal events, user interaction |
 | Application | `src/application/` | feature orchestration shared by CLI and TUI |
 | Domain | `src/domain/` | domain data and rules independent of transport/UI |
-| Infrastructure | `src/infrastructure/` | HTTP, Firebase, secure credentials, environment config |
+| Infrastructure | `src/infrastructure/` | HTTP, Firebase, file-backed sessions, environment config |
 
 Dependency direction should remain approximately:
 
@@ -98,7 +98,7 @@ CLI code must not:
 
 * Call `reqwest` directly.
 * Build Firebase REST requests directly.
-* Read or write keyring credentials directly when a session abstraction exists.
+* Read or write session files directly when a session abstraction exists.
 * Manually construct authorization headers for normal EMSYS commands.
 * Duplicate domain/business rules.
 
@@ -151,14 +151,14 @@ Current responsibilities include:
 
 * `config` — environment configuration.
 * `auth` — Firebase REST sign-in and token refresh.
-* `credentials` — OS secure credential storage.
+* `session_store` — file-backed refresh-token storage.
 * `session` — saved-session refresh orchestration.
 * `api` — EMSYS REST API communication.
 
 Rules:
 
 * Keep Firebase-specific logic inside auth/session infrastructure.
-* Keep keyring-specific logic inside credential infrastructure.
+* Keep refresh-token file handling inside session infrastructure.
 * Keep HTTP request construction inside API/auth infrastructure.
 * Reuse long-lived `reqwest::Client` instances where practical.
 * Normalize `EMSYS_API_URL` once rather than scattering URL manipulation.
@@ -183,7 +183,7 @@ ID token + refresh token
         ↓
 verify with GET /v1/users/me
         ↓
-save refresh token securely
+save refresh token to the configured session file
 ```
 
 Normal authenticated request flow:
@@ -319,7 +319,6 @@ Current core crates include:
 * `tracing-subscriber`
 * `dotenvy`
 * `rpassword`
-* `keyring`
 
 Before adding a crate:
 

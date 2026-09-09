@@ -8,7 +8,7 @@ EMSYS CLI - Cursor Rules
 - Async runtime: Tokio.
 - HTTP: Reqwest.
 - Authentication: Firebase REST.
-- Secure session storage: OS credential store via `keyring`.
+- Session storage: JSON file through `SessionManager`.
 - Backend: EMSYS Go REST API.
 - Multi-tenant: authenticated requests eventually include `X-Company-ID`.
 
@@ -21,7 +21,7 @@ emsys-cli/
 │   ├── application/       # shared use-case orchestration
 │   ├── cli/               # command-line presentation
 │   ├── domain/            # domain data/rules
-│   ├── infrastructure/    # API, Firebase, config, credentials, session
+│   ├── infrastructure/    # API, Firebase, config, session
 │   ├── tui/               # Ratatui UI + terminal events
 │   ├── bootstrap.rs
 │   ├── context.rs
@@ -81,7 +81,7 @@ Allowed:
 Do not:
 - call `reqwest` directly from feature commands
 - construct Bearer headers in commands
-- read keyring directly when `SessionManager` exists
+- read session files directly when `SessionManager` exists
 - duplicate authentication or tenant logic
 - reimplement feature logic separately from the TUI
 
@@ -98,7 +98,7 @@ Do not:
 Current infrastructure responsibilities:
 - `config`: environment loading and validation
 - `auth`: Firebase REST sign-in/refresh
-- `credentials`: secure refresh-token storage
+- `session_store`: file-backed refresh-token storage
 - `session`: session refresh orchestration
 - `api`: EMSYS HTTP requests
 
@@ -117,7 +117,7 @@ ID token + refresh token
     ↓
 GET /v1/users/me
     ↓
-save refresh token in OS credential store
+save refresh token in the configured session file
 ```
 
 Normal request flow:
