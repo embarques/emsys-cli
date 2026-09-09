@@ -4,6 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 
 use crate::{
+    application::income_statement::IncomeStatementService,
     context::AppContext,
     infrastructure::{
         api::EmsysApiClient,
@@ -209,8 +210,9 @@ async fn search_income_statements(
 
 async fn show_income_statement(context: &AppContext, id: u32) -> anyhow::Result<()> {
     let api = EmsysApiClient::new(&context.config);
-    let statement = api.income_statement(id).await?.data;
-    let summary = api.income_statement_summary(id).await?.data;
+    let detail = IncomeStatementService::new(api).show(id).await?;
+    let statement = detail.statement;
+    let summary = detail.summary;
 
     let branch = statement
         .branch
